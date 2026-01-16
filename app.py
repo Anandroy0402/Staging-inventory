@@ -23,12 +23,12 @@ DEPARTMENT_MAP = {
 }
 
 PRODUCT_GROUPS = {
-    "HAND TOOLS": ["PLIER", "STRIPPER", "WRENCH", "SPANNER", "HAMMER", "FILE", "SAW", "TOOL", "CHISEL", "CUTTER", "TAPE MEASURE"],
+    "HAND TOOLS": ["PLIER", "CUTTING PLIER", "STRIPPER", "WIRE STRIPPER", "WRENCH", "SPANNER", "HAMMER", "FILE", "SAW", "TOOL", "CHISEL", "CUTTER", "TAPE MEASURE", "MEASURING TAPE"],
     "PIPING COMPONENTS": ["PIPE", "FLANGE", "ELBOW", "TEE", "REDUCER", "BEND", "COUPLING", "NIPPLE", "BUSHING", "UPVC", "CPVC", "PVC"],
     "VALVE ASSEMBLIES": ["VALVE", "ACTUATOR", "BALL VALVE", "GATE VALVE", "CHECK VALVE", "GLOBE VALVE", "PLUG VALVE", "COCK"],
     "FASTENERS & HARDWARE": ["STUD", "BOLT", "NUT", "WASHER", "GASKET", "O-RING", "SEAL", "MECH SEAL", "GLOW", "JOINT"],
     "INSTRUMENTATION": ["TRANSMITTER", "GAUGE", "CABLE", "WIRE", "CONNECTOR", "PLUG", "SWITCH", "HUB", "SENSOR"],
-    "CONSUMABLES": ["BRUSH", "TAPE", "STICKER", "CHALK", "GLOVE", "CLEANER", "PAINT", "CEMENT", "HOSE", "ADHESIVE"]
+    "CONSUMABLES": ["BRUSH", "PAINT BRUSH", "TAPE", "STICKER", "CHALK", "GLOVE", "CLEANER", "PAINT", "CEMENT", "HOSE", "ADHESIVE"]
 }
 
 SPEC_TRAPS = {
@@ -38,24 +38,38 @@ SPEC_TRAPS = {
 }
 
 # --- AI UTILITIES ---
+def clean_description(text):
+    text = str(text).upper().replace('"', ' ')
+    text = re.sub(r'[^A-Z0-9\s./-]', ' ', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+def token_pattern(token):
+    return rf'(?<!\w){re.escape(token)}(?!\w)'
+
 def get_tech_dna(text):
-    text = str(text).upper()
+    text = clean_description(text)
     dna = {"numbers": set(re.findall(r'\d+(?:[./]\d+)?', text)), "attributes": {}}
     for cat, keywords in SPEC_TRAPS.items():
-        found = [k for k in keywords if re.search(rf'\b{k}\b', text)]
+        found = [k for k in keywords if re.search(token_pattern(k), text)]
         if found: dna["attributes"][cat] = set(found)
     return dna
 
 def intelligent_noun_extractor(text):
-    text = str(text).upper()
+    text = clean_description(text)
     phrases = ["MEASURING TAPE", "BALL VALVE", "GATE VALVE", "CHECK VALVE", "PAINT BRUSH", "WIRE STRIPPER", "CUTTING PLIER"]
     for p in phrases:
-        if p in text: return p
+        if re.search(token_pattern(p), text): return p
     all_nouns = [item for sublist in PRODUCT_GROUPS.values() for item in sublist]
     for n in all_nouns:
-        # FIXED: Changed 'noun' to 'n' to resolve NameError
-        if re.search(rf'\b{n}\b', text): return n
+        if re.search(token_pattern(n), text): return n
     return text.split()[0] if text.split() else "MISC"
+
+def map_product_group(noun):
+    for group, keywords in PRODUCT_GROUPS.items():
+        for keyword in keywords:
+            if re.search(token_pattern(keyword), noun):
+                return group
+    return "UNMAPPED"
 
 # --- MAIN ENGINE ---
 @st.cache_data
@@ -65,10 +79,11 @@ def run_intelligent_audit(file_path):
     id_col = next(c for c in df.columns if any(x in c.lower() for x in ['item', 'no']))
     desc_col = next(c for c in df.columns if 'desc' in c.lower())
     
-    df['Standard_Desc'] = df[desc_col].astype(str).str.upper().str.replace('"', '').str.strip()
-    df['Prefix'] = df[id_col].str.extract(r'^([A-Z]+)')
+    df['Standard_Desc'] = df[desc_col].apply(clean_description)
+    df['Prefix'] = df[id_col].astype(str).str.extract(r'^([A-Z]+)')
     df['Business_Dept'] = df['Prefix'].map(DEPARTMENT_MAP).fillna('GENERAL STOCK')
     df['Part_Noun'] = df['Standard_Desc'].apply(intelligent_noun_extractor)
+    df['Product_Group'] = df['Part_Noun'].apply(map_product_group)
 
     # NLP & Topic Modeling
     tfidf = TfidfVectorizer(max_features=300, stop_words='english')
@@ -79,6 +94,9 @@ def run_intelligent_audit(file_path):
     df['Cluster_ID'] = kmeans.fit_predict(tfidf_matrix)
     dists = kmeans.transform(tfidf_matrix)
     df['Confidence'] = (1 - (np.min(dists, axis=1) / np.max(dists, axis=1))).round(4)
+    cluster_groups = df.groupby('Cluster_ID')['Product_Group'].agg(lambda x: x.value_counts().idxmax())
+    df['Cluster_Group'] = df['Cluster_ID'].map(cluster_groups)
+    df['Cluster_Validated'] = df['Product_Group'] == df['Cluster_Group']
     
     # Anomaly
     iso = IsolationForest(contamination=0.04, random_state=42)
@@ -90,7 +108,7 @@ def run_intelligent_audit(file_path):
     return df, id_col, desc_col
 
 # --- DATA LOADING ---
-target_file = 'raw_data.csv' if os.path.exists('raw_data.csv') else 'Demo - Raw data.xlsx - Sheet2.csv'
+target_file = 'raw_data.csv'
 if os.path.exists(target_file):
     df_raw, id_col, desc_col = run_intelligent_audit(target_file)
 else:
@@ -178,11 +196,22 @@ with page[1]:
     
     # Data Table with sorting
     st.dataframe(
-        df[[id_col, 'Standard_Desc', 'Part_Noun', 'Business_Dept', 'Confidence']].sort_values('Confidence', ascending=False), 
+        df[[id_col, 'Standard_Desc', 'Part_Noun', 'Product_Group', 'Business_Dept', 'Confidence']].sort_values('Confidence', ascending=False),
         use_container_width=True,
         height=400
     )
     
+    summary = (
+        df.groupby('Product_Group', dropna=False)
+        .agg(Items=('Product_Group', 'size'), Mean_Confidence=('Confidence', 'mean'), Cluster_Match_Rate=('Cluster_Validated', 'mean'))
+        .reset_index()
+        .sort_values('Items', ascending=False)
+    )
+    summary['Mean_Confidence'] = summary['Mean_Confidence'].round(3)
+    summary['Cluster_Match_Rate'] = summary['Cluster_Match_Rate'].round(3)
+    st.markdown("#### 📌 Category Distribution & Confidence")
+    st.dataframe(summary, use_container_width=True, height=260)
+
     # Distribution of confidence
     fig_hist = px.histogram(df, x="Confidence", nbins=20, title="Confidence Score Distribution", color_discrete_sequence=['#636EFA'])
     st.plotly_chart(fig_hist, use_container_width=True)
@@ -247,14 +276,17 @@ with page[3]:
     
     st.markdown("""
     ### 1. Data Processing (ETL)
-    We standardize the raw 543 rows by stripping quote artifacts and lowercasing. We utilize **RegEx** to extract technical specifications (Numbers, Sizes, Genders) into a "Technical DNA" profile for every part.
+    We standardize the raw 543 rows by stripping quote artifacts, uppercasing, and cleaning symbols. We utilize **RegEx** to extract technical specifications (Numbers, Sizes, Genders) into a "Technical DNA" profile for every part.
     
     ### 2. Intelligent Categorization
-    Instead of standard K-Means (which is biased by word frequency), we use a **Prioritized Knowledge Base**. This ensures that tools like 'Pliers' aren't mislabeled as 'Pipes' just because they both mention a 'Size'.
+    Instead of standard K-Means (which is biased by word frequency), we use a **Prioritized Knowledge Base** to anchor nouns to super-categories. This ensures that tools like 'Pliers' aren't mislabeled as 'Pipes' just because they both mention a 'Size'.
     
-    ### 3. Anomaly Detection
+    ### 3. Cluster Validation
+    We validate the knowledge-anchored categories against **K-Means** clusters to ensure semantic consistency before scoring confidence.
+    
+    ### 4. Anomaly Detection
     We use the **Isolation Forest** algorithm. It isolates observations by randomly selecting a feature and then randomly selecting a split value. Outliers (anomalies) are easier to isolate, resulting in shorter paths.
     
-    ### 4. Fuzzy Match & Conflict Resolution
+    ### 5. Fuzzy Match & Conflict Resolution
     We use the **Levenshtein Distance** algorithm. However, we've added a **Business Logic Layer**: if two items have similar text but conflicting 'Technical DNA' (e.g. one is Male, one is Female), the system overrides the AI and flags it as a **Variant**, not a duplicate.
     """)
