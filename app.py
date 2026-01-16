@@ -45,7 +45,6 @@ def intelligent_noun_extractor(text):
 
 # --- REFINED DATA LOADING ---
 def load_raw_data():
-    # Priority: Check multiple possible names in the current directory
     possible_names = ['raw_data.csv', 'Demo - Raw data.xlsx - Sheet2.csv']
     for name in possible_names:
         if os.path.exists(name):
@@ -54,7 +53,6 @@ def load_raw_data():
             except UnicodeDecodeError:
                 return pd.read_csv(name, encoding='latin1')
     
-    # Sidebar fallback
     uploaded = st.sidebar.file_uploader("Data file not found in repo. Upload 'raw_data.csv' here:", type=['csv'])
     if uploaded:
         return pd.read_csv(uploaded)
@@ -76,13 +74,12 @@ def execute_ai_audit(df):
         nmf = NMF(n_components=10, random_state=42, init='nndsvd')
         nmf_features = nmf.fit_transform(tfidf_matrix)
         
-        # Mapping Topic Names
         feature_names = tfidf.get_feature_names_out()
         topic_labels = {i: " ".join([feature_names[ind] for ind in nmf.components_[i].argsort()[-2:][::-1]]).upper() for i in range(10)}
         
-        # FIX: Convert numpy array to Series before mapping
+        # Safe Mapping
         topic_ids = nmf_features.argmax(axis=1)
-        df['AI_Topic'] = pd.Series(topic_ids).map(topic_labels).values
+        df['AI_Topic'] = [topic_labels[tid] for tid in topic_ids]
         
         df['Extracted_Noun'] = df['Clean_Desc'].apply(intelligent_noun_extractor)
         df['Category'] = df.apply(lambda r: r['AI_Topic'] if r['Extracted_Noun'] in r['AI_Topic'] else f"{r['Extracted_Noun']} ({r['AI_Topic']})", axis=1)
@@ -133,15 +130,47 @@ if raw_df is not None:
     if df is not None:
         tabs = st.tabs(["📍 Categorization", "🎯 Clustering", "🚨 Anomalies", "👯 Exact Duplicates", "⚡ Fuzzy Matches", "🧠 AI Info", "📈 Reports"])
         
-        with tabs[0]: st.dataframe(df[[id_col, 'Clean_Desc', 'Category', 'Confidence']])
-        with tabs[1]: st.plotly_chart(px.scatter(df, x='Cluster_ID', y='Confidence', color='Category', hover_data=['Clean_Desc']), use_container_width=True)
-        with tabs[2]: st.warning(f"Found {len(df[df['Anomaly_Flag']==-1])} anomalies."); st.dataframe(df[df['Anomaly_Flag']==-1][[id_col, desc_col, 'Category']])
-        with tabs[3]: st.dataframe(exact_dups[[id_col, desc_col]] if not exact_dups.empty else "No exact duplicates.")
-        with tabs[4]: st.dataframe(fuzzy_df, use_container_width=True)
-        with tabs[5]: st.markdown("**Models:** NMF (Topics), K-Means (Clusters), Isolation Forest (Anomalies), Levenshtein (Fuzzy)")
+        with tabs[0]: 
+            st.header("Product Classification")
+            st.dataframe(df[[id_col, 'Clean_Desc', 'Category', 'Confidence']], use_container_width=True)
+        
+        with tabs[1]: 
+            st.header("ML Cluster Analysis")
+            st.plotly_chart(px.scatter(df, x='Cluster_ID', y='Confidence', color='Category', hover_data=['Clean_Desc']), use_container_width=True)
+        
+        with tabs[2]: 
+            st.header("Anomaly Detection")
+            anom = df[df['Anomaly_Flag'] == -1]
+            if not anom.empty:
+                st.warning(f"Detected {len(anom)} anomalies.")
+                st.dataframe(anom[[id_col, desc_col, 'Category']], use_container_width=True)
+            else:
+                st.success("No pattern anomalies found.")
+
+        with tabs[3]: 
+            st.header("Exact Matches")
+            if not exact_dups.empty: 
+                st.error(f"Found {len(exact_dups)} exact duplicates.")
+                st.dataframe(exact_dups[[id_col, desc_col]], use_container_width=True)
+            else: 
+                st.success("No exact duplicates detected.")
+
+        with tabs[4]: 
+            st.header("Fuzzy Logic")
+            if not fuzzy_df.empty:
+                st.dataframe(fuzzy_df, use_container_width=True)
+            else:
+                st.info("No fuzzy matches detected.")
+
+        with tabs[5]: 
+            st.header("Technical Stack")
+            st.markdown("- **Categorization:** NMF (Topics) + Heuristics\n- **Clustering:** K-Means\n- **Anomaly:** Isolation Forest\n- **Similarity:** Levenshtein + Spec-DNA Validation")
+
         with tabs[6]:
+            st.header("Executive Reports")
             c1, c2 = st.columns(2)
-            c1.plotly_chart(px.pie(df, names='Extracted_Noun', title="Inventory Breakdown"))
-            c2.plotly_chart(go.Figure(go.Indicator(mode="gauge+number", value=(len(df[df['Anomaly_Flag']==1])/len(df)*100), title={'text':"Data Health %"})))
+            c1.plotly_chart(px.pie(df, names='Extracted_Noun', title="Inventory Split"), use_container_width=True)
+            health = (len(df[df['Anomaly_Flag']==1])/len(df)*100)
+            c2.plotly_chart(go.Figure(go.Indicator(mode="gauge+number", value=health, title={'text':"Data Integrity %"})), use_container_width=True)
 else:
     st.info("👋 Waiting for Data. Please ensure 'raw_data.csv' is in your GitHub repository.")
