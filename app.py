@@ -24,6 +24,7 @@ MIN_DISTANCE_THRESHOLD = 1e-8  # Prevent divide-by-zero in distance-based confid
 COMPARISON_WINDOW_SIZE = 50  # Windowed comparisons keep duplicate checks lightweight.
 FUZZY_SIMILARITY_THRESHOLD = 0.85
 SEMANTIC_SIMILARITY_THRESHOLD = 0.9
+HF_BATCH_SIZE = 16
 
 PRODUCT_GROUPS = {
     "Piping & Fittings": ["FLANGE", "PIPE", "ELBOW", "TEE", "UNION", "REDUCER", "BEND", "COUPLING", "NIPPLE", "BUSHING", "UPVC", "CPVC", "PVC"],
@@ -107,9 +108,13 @@ def run_hf_zero_shot(texts, labels):
     if isinstance(texts, str):
         texts = [texts]
     try:
-        results = classifier(texts, candidate_labels=labels)
-        if isinstance(results, dict):
-            results = [results]
+        results = []
+        for start in range(0, len(texts), HF_BATCH_SIZE):
+            batch = texts[start:start + HF_BATCH_SIZE]
+            batch_results = classifier(batch, candidate_labels=labels)
+            if isinstance(batch_results, dict):
+                batch_results = [batch_results]
+            results.extend(batch_results)
         return results
     except (RuntimeError, ValueError):
         st.warning("Hugging Face classification failed; using existing categories.")
@@ -120,7 +125,7 @@ def compute_embeddings(texts):
     if not model:
         return None
     try:
-        embeddings = model.encode(texts, show_progress_bar=False)
+        embeddings = model.encode(texts, show_progress_bar=False, batch_size=HF_BATCH_SIZE)
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         norms[norms == 0] = 1
         return embeddings / norms
