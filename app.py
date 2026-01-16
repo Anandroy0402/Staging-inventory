@@ -99,7 +99,7 @@ def run_hf_zero_shot(texts, labels):
     if not classifier:
         return None
     try:
-        results = classifier(texts, candidate_labels=labels, batch_size=8)
+        results = classifier(texts, candidate_labels=labels)
         if isinstance(results, dict):
             results = [results]
         return results
@@ -380,12 +380,13 @@ with page[2]:
             sem_list = []
             recs = df.reset_index(drop=True).to_dict('records')
             embeddings = [np.array(e) if e is not None else None for e in df['HF_Embedding'].tolist()]
+            window_size = 50
             for i in range(len(recs)):
-                for j in range(i + 1, min(i + 50, len(recs))):
+                for j in range(i + 1, min(i + window_size, len(recs))):
                     emb_i, emb_j = embeddings[i], embeddings[j]
                     if emb_i is None or emb_j is None:
                         continue
-                    sim = float(np.dot(emb_i, emb_j))
+                    sim = float(np.dot(emb_i, emb_j))  # Cosine similarity on normalized embeddings.
                     if sim > 0.9:
                         sem_list.append({
                             'ID A': recs[i][id_col],
