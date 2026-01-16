@@ -20,7 +20,7 @@ st.set_page_config(page_title="AI Inventory Auditor Pro", layout="wide", page_ic
 
 # --- KNOWLEDGE BASE: DOMAIN LOGIC ---
 DEFAULT_PRODUCT_GROUP = "Consumables & General"
-MIN_DISTANCE_THRESHOLD = 1e-8  # Prevent divide-by-zero in distance-based confidence.
+MIN_DISTANCE_THRESHOLD = 1e-8  # Replace zero distances to avoid divide-by-zero in confidence calculations.
 COMPARISON_WINDOW_SIZE = 50  # Windowed comparisons keep duplicate checks lightweight.
 FUZZY_SIMILARITY_THRESHOLD = 0.85
 SEMANTIC_SIMILARITY_THRESHOLD = 0.9
@@ -84,6 +84,10 @@ def map_product_group(noun):
 def dominant_group(series):
     counts = series.value_counts()
     return counts.idxmax() if not counts.empty else "UNMAPPED"
+
+def apply_distance_floor(distances, min_threshold=MIN_DISTANCE_THRESHOLD):
+    max_dist = np.max(distances, axis=1)
+    return np.where(max_dist == 0, min_threshold, max_dist)
 
 @st.cache_resource
 def get_zero_shot_classifier():
@@ -153,8 +157,7 @@ def run_intelligent_audit(file_path):
     kmeans = KMeans(n_clusters=8, random_state=42, n_init=10)
     df['Cluster_ID'] = kmeans.fit_predict(tfidf_matrix)
     dists = kmeans.transform(tfidf_matrix)
-    max_tfidf_dist = np.max(dists, axis=1)
-    max_tfidf_dist = np.where(max_tfidf_dist == 0, MIN_DISTANCE_THRESHOLD, max_tfidf_dist)
+    max_tfidf_dist = apply_distance_floor(dists)
     df['Confidence'] = (1 - (np.min(dists, axis=1) / max_tfidf_dist)).round(4)
     cluster_groups = df.groupby('Cluster_ID')['Product_Group'].agg(dominant_group)
     df['Cluster_Group'] = df['Cluster_ID'].map(cluster_groups)
@@ -179,8 +182,7 @@ def run_intelligent_audit(file_path):
         kmeans_hf = KMeans(n_clusters=8, random_state=42, n_init=10)
         df['HF_Cluster_ID'] = kmeans_hf.fit_predict(embeddings)
         hf_dists = kmeans_hf.transform(embeddings)
-        max_dist = np.max(hf_dists, axis=1)
-        max_dist = np.where(max_dist == 0, MIN_DISTANCE_THRESHOLD, max_dist)
+        max_dist = apply_distance_floor(hf_dists)
         df['HF_Cluster_Confidence'] = (1 - (np.min(hf_dists, axis=1) / max_dist)).round(4)
         iso_hf = IsolationForest(contamination=0.04, random_state=42)
         df['HF_Anomaly_Flag'] = iso_hf.fit_predict(embeddings)
@@ -394,15 +396,14 @@ with page[2]:
         if df['HF_Embedding'].apply(lambda x: x is None).all():
             st.info("Semantic duplicate detection unavailable (HF embeddings not loaded).")
         else:
-            sem_list = []
             records = df.reset_index(drop=True)
-            recs = records.to_dict('records')
-            embeddings = records['HF_Embedding'].tolist()
-            window_size = COMPARISON_WINDOW_SIZE  # Keep comparisons lightweight for UI responsiveness.
-            if any(e is None for e in embeddings):
+            if records['HF_Embedding'].apply(lambda x: x is None).any():
                 st.info("Semantic duplicate detection unavailable (HF embeddings incomplete).")
-                sem_list = []
             else:
+                sem_list = []
+                recs = records.to_dict('records')
+                embeddings = records['HF_Embedding'].tolist()
+                window_size = COMPARISON_WINDOW_SIZE  # Keep comparisons lightweight for UI responsiveness.
                 for i in range(len(recs)):
                     for j in range(i + 1, min(i + window_size, len(recs))):
                         sim = float(np.dot(embeddings[i], embeddings[j]))  # Cosine similarity on normalized embeddings.
@@ -414,10 +415,10 @@ with page[2]:
                                 'Desc B': recs[j]['Standard_Desc'],
                                 'Semantic Match %': f"{sim:.1%}"
                             })
-            if sem_list:
-                st.dataframe(pd.DataFrame(sem_list), use_container_width=True, height=400)
-            else:
-                st.success("No semantic duplicates found in this filtered view.")
+                if sem_list:
+                    st.dataframe(pd.DataFrame(sem_list), use_container_width=True, height=400)
+                else:
+                    st.success("No semantic duplicates found in this filtered view.")
 
 # --- PAGE: METHODOLOGY ---
 with page[3]:
