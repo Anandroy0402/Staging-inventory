@@ -78,7 +78,7 @@ def run_intelligent_audit(file_path):
     kmeans = KMeans(n_clusters=8, random_state=42, n_init=10)
     df['Cluster_ID'] = kmeans.fit_predict(tfidf_matrix)
     dists = kmeans.transform(tfidf_matrix)
-    df['Confidence'] = (1 - (np.min(dists, axis=1) / np.max(dists))).round(4)
+    df['Confidence'] = (1 - (np.min(dists, axis=1) / np.max(dists, axis=1))).round(4)
     
     # Anomaly
     iso = IsolationForest(contamination=0.04, random_state=42)
