@@ -97,34 +97,48 @@ else:
     st.error("Data file missing from repository. Please ensure 'raw_data.csv' is present.")
     st.stop()
 
-# --- SIDEBAR NAVIGATION & FILTERS ---
-st.sidebar.title("🛡️ Inventory Auditor Pro")
-page = st.sidebar.selectbox("Navigation", ["📈 Executive Dashboard", "📍 Categorization Audit", "🚨 Quality Hub (Anomalies/Dups)", "🧠 Technical Methodology"])
+# --- HEADER & MODERN NAVIGATION ---
+st.title("🛡️ AI Inventory Auditor Pro")
+st.markdown("### Advanced Inventory Intelligence & Quality Management")
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Live Filters")
-selected_dept = st.sidebar.multiselect("Department", options=df_raw['Business_Dept'].unique(), default=df_raw['Business_Dept'].unique())
-selected_noun = st.sidebar.multiselect("Product Noun", options=sorted(df_raw['Part_Noun'].unique()), default=[])
+# Modern horizontal tab navigation
+page = st.tabs(["📈 Executive Dashboard", "📍 Categorization Audit", "🚨 Quality Hub (Anomalies/Dups)", "🧠 Technical Methodology"])
 
-# Apply Filters
-df = df_raw[df_raw['Business_Dept'].isin(selected_dept)]
-if selected_noun:
-    df = df[df['Part_Noun'].isin(selected_noun)]
+# Initialize filtered dataframe (will be filtered per page as needed)
+df = df_raw.copy()
 
 # --- PAGE: EXECUTIVE DASHBOARD ---
-if page == "📈 Executive Dashboard":
-    st.header("Inventory Health Dashboard")
+with page[0]:
+    st.markdown("#### 📊 Inventory Health Overview")
+    st.markdown("Get a bird's eye view of your inventory data quality and distribution.")
+    
+    # Filters at the top
+    with st.expander("🔍 Filter Data", expanded=False):
+        fcol1, fcol2 = st.columns(2)
+        with fcol1:
+            selected_dept = st.multiselect("Department", options=df_raw['Business_Dept'].unique(), default=df_raw['Business_Dept'].unique(), key="dash_dept")
+        with fcol2:
+            selected_noun = st.multiselect("Product Noun", options=sorted(df_raw['Part_Noun'].unique()), default=[], key="dash_noun")
+    
+    # Apply Filters
+    df = df_raw[df_raw['Business_Dept'].isin(selected_dept)]
+    if selected_noun:
+        df = df[df['Part_Noun'].isin(selected_noun)]
+    
+    st.markdown("---")
     
     # KPI Row
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-    kpi1.metric("SKUs Analyzed", len(df))
-    kpi2.metric("Mean AI Confidence", f"{df['Confidence'].mean():.1%}")
-    kpi3.metric("Anomalies Found", len(df[df['Anomaly_Flag'] == -1]))
-    kpi4.metric("True Duplicate Pairs", "Audit Required")
+    kpi1.metric("📦 SKUs Analyzed", len(df))
+    kpi2.metric("🎯 Mean AI Confidence", f"{df['Confidence'].mean():.1%}")
+    kpi3.metric("⚠️ Anomalies Found", len(df[df['Anomaly_Flag'] == -1]))
+    kpi4.metric("🔄 Duplicate Pairs", "Audit Required")
 
+    st.markdown("---")
+    
     col1, col2 = st.columns(2)
     with col1:
-        fig_pie = px.pie(df, names='Business_Dept', title="Inventory Split by Dept", hole=0.4)
+        fig_pie = px.pie(df, names='Business_Dept', title="Inventory Distribution by Department", hole=0.4)
         st.plotly_chart(fig_pie, use_container_width=True)
     with col2:
         top_nouns = df['Part_Noun'].value_counts().head(10).reset_index()
@@ -142,20 +156,56 @@ if page == "📈 Executive Dashboard":
     st.plotly_chart(fig_gauge, use_container_width=True)
 
 # --- PAGE: CATEGORIZATION AUDIT ---
-elif page == "📍 Categorization Audit":
-    st.header("AI Categorization & Filtered Audit")
-    st.markdown("Use the sidebar filters to drill down into specific product categories.")
+with page[1]:
+    st.markdown("#### 📍 AI Categorization & Filtered Audit")
+    st.markdown("Drill down into specific product categories with intelligent filtering.")
+    
+    # Filters at the top of the table
+    with st.expander("🔍 Filter Data", expanded=True):
+        fcol1, fcol2 = st.columns(2)
+        with fcol1:
+            selected_dept = st.multiselect("Department", options=df_raw['Business_Dept'].unique(), default=df_raw['Business_Dept'].unique(), key="cat_dept")
+        with fcol2:
+            selected_noun = st.multiselect("Product Noun", options=sorted(df_raw['Part_Noun'].unique()), default=[], key="cat_noun")
+    
+    # Apply Filters
+    df = df_raw[df_raw['Business_Dept'].isin(selected_dept)]
+    if selected_noun:
+        df = df[df['Part_Noun'].isin(selected_noun)]
+    
+    st.markdown("---")
+    st.markdown(f"**Showing {len(df)} items**")
     
     # Data Table with sorting
-    st.dataframe(df[[id_col, 'Standard_Desc', 'Part_Noun', 'Business_Dept', 'Confidence']].sort_values('Confidence', ascending=False), use_container_width=True)
+    st.dataframe(
+        df[[id_col, 'Standard_Desc', 'Part_Noun', 'Business_Dept', 'Confidence']].sort_values('Confidence', ascending=False), 
+        use_container_width=True,
+        height=400
+    )
     
     # Distribution of confidence
     fig_hist = px.histogram(df, x="Confidence", nbins=20, title="Confidence Score Distribution", color_discrete_sequence=['#636EFA'])
     st.plotly_chart(fig_hist, use_container_width=True)
 
 # --- PAGE: QUALITY HUB ---
-elif page == "🚨 Quality Hub (Anomalies/Dups)":
-    st.header("Anomaly & Duplicate Identification")
+with page[2]:
+    st.markdown("#### 🚨 Anomaly & Duplicate Identification")
+    st.markdown("Identify quality issues and potential duplicates in your inventory data.")
+    
+    # Filters at the top
+    with st.expander("🔍 Filter Data", expanded=False):
+        fcol1, fcol2 = st.columns(2)
+        with fcol1:
+            selected_dept = st.multiselect("Department", options=df_raw['Business_Dept'].unique(), default=df_raw['Business_Dept'].unique(), key="qual_dept")
+        with fcol2:
+            selected_noun = st.multiselect("Product Noun", options=sorted(df_raw['Part_Noun'].unique()), default=[], key="qual_noun")
+    
+    # Apply Filters
+    df = df_raw[df_raw['Business_Dept'].isin(selected_dept)]
+    if selected_noun:
+        df = df[df['Part_Noun'].isin(selected_noun)]
+    
+    st.markdown("---")
     
     t1, t2 = st.tabs(["⚠️ Anomalies", "👯 Fuzzy Duplicates"])
     
@@ -163,7 +213,7 @@ elif page == "🚨 Quality Hub (Anomalies/Dups)":
         st.subheader("Statistical Anomalies (Isolation Forest)")
         anoms = df[df['Anomaly_Flag'] == -1]
         st.warning(f"Found {len(anoms)} anomalies in the current view.")
-        st.dataframe(anoms[[id_col, desc_col, 'Part_Noun']], use_container_width=True)
+        st.dataframe(anoms[[id_col, desc_col, 'Part_Noun']], use_container_width=True, height=400)
         
     with t2:
         st.subheader("Fuzzy Duplicate Audit (Spec-Aware)")
@@ -186,13 +236,15 @@ elif page == "🚨 Quality Hub (Anomalies/Dups)":
                     })
         
         if fuzzy_list:
-            st.dataframe(pd.DataFrame(fuzzy_list), use_container_width=True)
+            st.dataframe(pd.DataFrame(fuzzy_list), use_container_width=True, height=400)
         else:
             st.success("No fuzzy duplicates found in this filtered view.")
 
 # --- PAGE: METHODOLOGY ---
-elif page == "🧠 Technical Methodology":
-    st.header("Technical Methodology & AI Stack")
+with page[3]:
+    st.markdown("#### 🧠 Technical Methodology & AI Stack")
+    st.markdown("Understand the advanced algorithms powering this inventory intelligence system.")
+    
     st.markdown("""
     ### 1. Data Processing (ETL)
     We standardize the raw 543 rows by stripping quote artifacts and lowercasing. We utilize **RegEx** to extract technical specifications (Numbers, Sizes, Genders) into a "Technical DNA" profile for every part.
