@@ -110,6 +110,8 @@ def get_hf_token():
     )
 
 def call_hf_inference(model, payload, token, warning_message):
+    if not token:
+        return None
     data = json.dumps(payload).encode("utf-8")
     req = request.Request(
         f"{HF_INFERENCE_API_URL}/{model}",
@@ -124,7 +126,15 @@ def call_hf_inference(model, payload, token, warning_message):
             return None
         return result
     except (error.HTTPError, error.URLError, socket.timeout, ValueError) as exc:
-        st.warning(f"{warning_message} ({exc.__class__.__name__})")
+        if isinstance(exc, socket.timeout):
+            detail = "timeout"
+        elif isinstance(exc, error.HTTPError):
+            detail = f"HTTP {exc.code}"
+        elif isinstance(exc, error.URLError):
+            detail = "network error"
+        else:
+            detail = "invalid response"
+        st.warning(f"{warning_message} ({detail})")
         return None
 
 def run_hf_zero_shot(texts, labels):
@@ -177,7 +187,7 @@ def compute_embeddings(texts):
             )
             if not batch_embeddings:
                 return None
-            if isinstance(batch_embeddings, list) and batch_embeddings and isinstance(batch_embeddings[0], (int, float)):
+            if isinstance(batch_embeddings, list) and len(batch_embeddings) > 0 and isinstance(batch_embeddings[0], (int, float)):
                 # Hugging Face returns a flat list for single inputs; wrap for consistent batching.
                 batch_embeddings = [batch_embeddings]
             embeddings.extend(batch_embeddings)
