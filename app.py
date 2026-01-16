@@ -140,7 +140,7 @@ def compute_embeddings(texts):
 
 # --- MAIN ENGINE ---
 @st.cache_data
-def run_intelligent_audit(file_path, enable_hf=False):
+def run_intelligent_audit(file_path, enable_hf_models=False):
     df = pd.read_csv(file_path, encoding='latin1')
     df.columns = [c.strip() for c in df.columns]
     id_col = next(c for c in df.columns if any(x in c.lower() for x in ['item', 'no']))
@@ -168,8 +168,10 @@ def run_intelligent_audit(file_path, enable_hf=False):
     iso = IsolationForest(contamination=0.04, random_state=42)
     df['Anomaly_Flag'] = iso.fit_predict(tfidf_matrix) # Using tfidf for complexity-based anomalies
 
+    standard_desc = df['Standard_Desc'].tolist() if enable_hf_models else None
+
     # Hugging Face Zero-Shot Classification
-    hf_results = run_hf_zero_shot(df['Standard_Desc'].tolist(), list(PRODUCT_GROUPS.keys())) if enable_hf else None
+    hf_results = run_hf_zero_shot(standard_desc, list(PRODUCT_GROUPS.keys())) if enable_hf_models else None
     if hf_results:
         df['HF_Product_Group'] = [res['labels'][0] for res in hf_results]
         df['HF_Product_Confidence'] = [round(res['scores'][0], 4) for res in hf_results]
@@ -178,7 +180,7 @@ def run_intelligent_audit(file_path, enable_hf=False):
         df['HF_Product_Confidence'] = df['Confidence']
 
     # Hugging Face Embeddings for Clustering/Anomaly
-    embeddings = compute_embeddings(df['Standard_Desc'].tolist()) if enable_hf else None
+    embeddings = compute_embeddings(standard_desc) if enable_hf_models else None
     if embeddings is not None:
         kmeans_hf = KMeans(n_clusters=8, random_state=42, n_init=10)
         df['HF_Cluster_ID'] = kmeans_hf.fit_predict(embeddings)
@@ -202,7 +204,7 @@ def run_intelligent_audit(file_path, enable_hf=False):
 # --- DATA LOADING ---
 target_file = 'raw_data.csv'
 if os.path.exists(target_file):
-    df_raw, id_col, desc_col = run_intelligent_audit(target_file, enable_hf=ENABLE_HF_MODELS)
+    df_raw, id_col, desc_col = run_intelligent_audit(target_file, enable_hf_models=ENABLE_HF_MODELS)
 else:
     st.error("Data file missing from repository. Please ensure 'raw_data.csv' is present.")
     st.stop()
