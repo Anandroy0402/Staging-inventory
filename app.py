@@ -97,9 +97,11 @@ def run_intelligent_audit(file_path):
     df['Cluster_ID'] = kmeans.fit_predict(tfidf_matrix)
     dists = kmeans.transform(tfidf_matrix)
     df['Confidence'] = (1 - (np.min(dists, axis=1) / np.max(dists, axis=1))).round(4)
-    cluster_groups = df.groupby('Cluster_ID')['Product_Group'].agg(
-        lambda x: x.value_counts().idxmax() if not x.empty else "UNMAPPED"
-    )
+    def dominant_group(series):
+        counts = series.value_counts()
+        return counts.idxmax() if not counts.empty else "UNMAPPED"
+
+    cluster_groups = df.groupby('Cluster_ID')['Product_Group'].agg(dominant_group)
     df['Cluster_Group'] = df['Cluster_ID'].map(cluster_groups)
     df['Cluster_Validated'] = df['Product_Group'] == df['Cluster_Group']
     
@@ -208,7 +210,7 @@ with page[1]:
     
     summary = (
         df.groupby('Product_Group', dropna=False)
-        .agg(Items=('Product_Group', 'size'), Mean_Confidence=('Confidence', 'mean'), Cluster_Match_Rate=('Cluster_Validated', 'mean'))
+        .agg(Items=('Product_Group', 'count'), Mean_Confidence=('Confidence', 'mean'), Cluster_Match_Rate=('Cluster_Validated', 'mean'))
         .reset_index()
         .sort_values('Items', ascending=False)
     )
