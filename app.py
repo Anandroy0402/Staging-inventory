@@ -210,7 +210,7 @@ with page[1]:
     
     summary = (
         df.groupby('Product_Group', dropna=False)
-        .agg(Items=('Product_Group', 'count'), Mean_Confidence=('Confidence', 'mean'), Cluster_Match_Rate=('Cluster_Validated', 'mean'))
+        .agg(Items=(id_col, 'count'), Mean_Confidence=('Confidence', 'mean'), Cluster_Match_Rate=('Cluster_Validated', 'mean'))
         .reset_index()
         .sort_values('Items', ascending=False)
     )
