@@ -32,7 +32,7 @@ HF_ZERO_SHOT_MODEL = "facebook/bart-large-mnli"
 HF_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 HF_INFERENCE_API_URL = "https://api-inference.huggingface.co/models"
 HF_INFERENCE_TIMEOUT = 30
-ENABLE_HF_MODELS = os.getenv("ENABLE_HF_MODELS", "false").lower() == "true"
+ENABLE_HF_MODELS = os.getenv("ENABLE_HF_MODELS", "true").lower() == "true"
 HF_CONFIDENCE_MIN_THRESHOLD = 0.8
 HF_CONFIDENCE_MIN_TARGET = 0.6
 HF_CONFIDENCE_MAX_TARGET = 0.98
