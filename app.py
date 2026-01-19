@@ -100,19 +100,26 @@ def resolve_setting(key, default=None, as_bool=False):
         return str(value).strip().lower() == "true"
     return str(value).strip()
 
-# --- AI CONNECTIVITY BACKEND (REFACTORED) ---
+# --- AI CONNECTIVITY BACKEND (UPDATED) ---
 class InventoryAIBackend:
     """
     Encapsulates all Hugging Face API interactions, connection checks, 
     token management, and retry logic.
     """
     def __init__(self):
+        # Force enable via code if you want to skip configuration for testing
+        # Or read from secrets (Recommended)
         self.enabled = resolve_setting("ENABLE_HF_MODELS", default=False, as_bool=True)
         self.token = self._resolve_token()
-        self.client = InferenceClient(token=self.token, timeout=HF_INFERENCE_TIMEOUT) if self.token else None
-        self.status = {"zero_shot": False, "embeddings": False, "reason": "init", "detail": ""}
+        
+        # Only initialize client if token exists
+        if self.token:
+            self.client = InferenceClient(token=self.token, timeout=HF_INFERENCE_TIMEOUT)
+        else:
+            self.client = None
 
     def _resolve_token(self):
+        # Checks env vars and secrets for common token names
         keys = ["HF_TOKEN", "HUGGINGFACEHUB_API_TOKEN", "HUGGINGFACE_API_TOKEN"]
         for k in keys:
             t = resolve_setting(k)
@@ -139,14 +146,14 @@ class InventoryAIBackend:
             return func()
         except (InferenceTimeoutError, RateLimitError, HfHubHTTPError) as e:
             should_retry = False
+            # Check for standard retryable errors
             if isinstance(e, (InferenceTimeoutError, RateLimitError)):
                 should_retry = True
             elif isinstance(e, HfHubHTTPError) and e.response.status_code in [429, 503, 504]:
                 should_retry = True
             
-            # Check for loading state messages
-            err_str = str(e).lower()
-            if "loading" in err_str:
+            # Check for "loading" text in error message
+            if "loading" in str(e).lower():
                 should_retry = True
             
             if should_retry and retries > 0:
@@ -156,44 +163,72 @@ class InventoryAIBackend:
 
     @st.cache_data(ttl=HF_CONNECTION_CACHE_TTL)
     def check_health(_self):  # _self prevents hashing the object
-        """Comprehensive health check returns a dict for the UI."""
-        if not _self.enabled:
-            return {"enabled": False, "status": "disabled", "reason": "disabled"}
-        if not _self.token:
-            return {"enabled": False, "status": "missing_token", "reason": "Token not found or invalid"}
+        """
+        Comprehensive health check returns a dict for the UI.
+        ALWAYS returns all keys to prevent KeyError.
+        """
+        # 1. Initialize Defaults (Prevents KeyError)
+        status_dict = {
+            "enabled": False,
+            "status": "init",
+            "zero_shot": False,
+            "embeddings": False,
+            "reason": "Initializing..."
+        }
 
+        # 2. Check Configuration
+        if not _self.enabled:
+            status_dict.update({"status": "disabled", "reason": "Feature disabled in config"})
+            return status_dict
+            
+        if not _self.token:
+            status_dict.update({"status": "missing_token", "reason": "No valid HF_TOKEN found"})
+            return status_dict
+
+        # 3. Check Network
         net_ok, net_msg = _self._check_network()
         if not net_ok:
-            return {"enabled": False, "status": "network_error", "reason": net_msg}
+            status_dict.update({"status": "network_error", "reason": net_msg})
+            return status_dict
 
-        # Functional Tests
+        # 4. Functional Tests (Actually try to call the API)
         zs_ok, emb_ok = False, False
         test_text = "Inventory Audit Check"
         
         try:
+            # Test Embeddings
             _self._execute_with_retry(lambda: _self.client.feature_extraction(test_text, model=HF_EMBEDDING_MODEL))
             emb_ok = True
-        except Exception: pass
+        except Exception: 
+            pass # Keep going to test Zero Shot
 
         try:
+            # Test Zero Shot
             _self._execute_with_retry(lambda: _self.client.zero_shot_classification(test_text, list(PRODUCT_GROUPS.keys())[:3]))
             zs_ok = True
-        except Exception: pass
+        except Exception: 
+            pass
 
+        # 5. Determine Final Status
         if zs_ok and emb_ok:
-            status = "connected"
+            final_status = "connected"
+            reason = "Online"
         elif zs_ok or emb_ok:
-            status = "partial"
+            final_status = "partial"
+            reason = "Some models failed"
         else:
-            status = "api_error"
+            final_status = "api_error"
+            reason = "API reachable but models failed"
 
-        return {
+        status_dict.update({
             "enabled": True,
-            "status": status,
+            "status": final_status,
             "zero_shot": zs_ok,
             "embeddings": emb_ok,
-            "reason": "All systems go" if status == "connected" else "Some models failed"
-        }
+            "reason": reason
+        })
+        
+        return status_dict
 
     def get_zero_shot(self, texts, labels):
         if not self.token: return None
@@ -224,12 +259,10 @@ class InventoryAIBackend:
                 res = self._execute_with_retry(
                     lambda: self.client.feature_extraction(batch, model=HF_EMBEDDING_MODEL)
                 )
-                # Handle single vs batch return
                 if isinstance(res, list) and res and isinstance(res[0], float):
                     res = [res]
                 raw_embeds.extend(res)
             
-            # Normalize
             embeddings = np.array(raw_embeds, dtype=float)
             norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
             norms[norms == 0] = 1
@@ -237,7 +270,6 @@ class InventoryAIBackend:
         except Exception as e:
             st.warning(f"Embedding generation failed: {str(e)}")
             return None
-
 # Initialize Backend
 ai_backend = InventoryAIBackend()
 
