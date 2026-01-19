@@ -25,18 +25,15 @@ except ImportError:
 import huggingface_hub
 try:
     from huggingface_hub import InferenceClient
-    # Correct error imports for newer huggingface_hub versions
     from huggingface_hub.errors import InferenceTimeoutError, HfHubHTTPError
     
-    # Create alias for RateLimitError since it was removed in v0.20+
-    # We will handle 429 status codes manually using HfHubHTTPError
+    # Create alias for RateLimitError (removed in newer versions)
     RateLimitError = HfHubHTTPError
-    
 except ImportError:
     st.error("Missing dependency: pip install huggingface_hub>=0.20.0")
     st.stop()
 except Exception as e:
-    st.error(f"Error importing Hugging Face libraries: {e}")
+    st.error(f"Import Error: {e}")
     st.stop()
 
 # --- PAGE CONFIG ---
