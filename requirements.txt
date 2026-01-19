@@ -6,4 +6,4 @@ plotly
 transformers
 torch
 sentence-transformers
-huggingface_hub
+huggingface_hub>=0.20.0
