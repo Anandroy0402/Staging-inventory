@@ -3,27 +3,24 @@ import pandas as pd
 import numpy as np
 import re
 import os
-import json
 import socket
-try:
-    import tomllib
-except ImportError:
-    # Fallback for Python < 3.11
-    import tomli as tomllib
 import time
 from pathlib import Path
 from difflib import SequenceMatcher
 
 # Advanced AI/ML Imports
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.decomposition import NMF
 from sklearn.ensemble import IsolationForest
 from sklearn.cluster import KMeans
 import plotly.express as px
 import plotly.graph_objects as go
 
 # Hugging Face Hub Integration
-import huggingface_hub
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+
 try:
     from huggingface_hub import InferenceClient
     from huggingface_hub.utils import InferenceTimeoutError, RateLimitError, HfHubHTTPError
@@ -34,82 +31,17 @@ except ImportError:
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="AI Inventory Auditor Pro", layout="wide", page_icon="🛡️")
 
-def get_streamlit_secrets():
-    """
-    Load secrets from .streamlit/secrets.toml file.
-    
-    Returns:
-        dict: Dictionary of secrets from the TOML file. Returns empty dict if file
-              doesn't exist or cannot be parsed.
-    
-    Note:
-        This function safely handles missing files and parse errors by returning
-        an empty dictionary rather than raising exceptions.
-    """
-    secrets_path = Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
-    if not secrets_path.exists():
-        return {}
-    try:
-        with secrets_path.open("rb") as handle:
-            return tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError):
-        return {}
-
-def resolve_bool_setting(key, default=False):
-    """
-    Resolve a boolean setting from environment variables or secrets.
-    """
-    value = os.getenv(key)
-    if value is None:
-        # Try file-based secrets first (more reliable)
-        secrets = get_streamlit_secrets()
-        if key in secrets:
-            value = secrets[key]
-        else:
-            # Fall back to st.secrets as last resort
-            try:
-                value = st.secrets.get(key)
-            except (AttributeError, KeyError):
-                value = None
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() == "true"
-
-# --- KNOWLEDGE BASE: DOMAIN LOGIC ---
+# --- CONFIGURATION & CONSTANTS ---
 DEFAULT_PRODUCT_GROUP = "Consumables & General"
-MIN_DISTANCE_THRESHOLD = 1e-8  # Replace zero distances to avoid divide-by-zero in confidence calculations.
-COMPARISON_WINDOW_SIZE = 50  # Windowed comparisons keep duplicate checks lightweight.
+COMPARISON_WINDOW_SIZE = 50
 FUZZY_SIMILARITY_THRESHOLD = 0.85
 SEMANTIC_SIMILARITY_THRESHOLD = 0.9
 HF_BATCH_SIZE = 16
 HF_ZERO_SHOT_MODEL = "facebook/bart-large-mnli"
 HF_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-HF_INFERENCE_API_URL = "https://api-inference.huggingface.co/models"
-HF_API_HOSTNAME = "api-inference.huggingface.co"
 HF_INFERENCE_TIMEOUT = 30
-ENABLE_HF_MODELS = resolve_bool_setting("ENABLE_HF_MODELS", default=False)
-HF_CONFIDENCE_MIN_THRESHOLD = 0.8
-HF_CONFIDENCE_MIN_TARGET = 0.6
-HF_CONFIDENCE_MAX_TARGET = 0.98
 HF_CONNECTION_CACHE_TTL = 30
-HF_CONNECTION_TEST_TEXT = "Inventory audit connection check."
-HF_MAX_RETRIES = 2  # Number of retries for transient failures
-HF_RETRY_DELAY = 2  # Base delay between retries in seconds
-HF_MAX_RETRY_DELAY = 10  # Maximum delay cap for exponential backoff
-HF_TOKEN_MIN_LENGTH = 20  # Minimum length for valid HF tokens
-HF_MODEL_LOADING_PATTERNS = [
-    "loading",
-    "is currently loading",
-    "model is loading"
-]  # Patterns indicating model is loading and should be retried
-HF_TOKEN_KEYS = (
-    "HF_TOKEN",
-    "HUGGINGFACEHUB_API_TOKEN",
-    "HUGGINGFACE_API_TOKEN",
-    "HUGGINGFACE_TOKEN"
-)
+HF_API_HOSTNAME = "api-inference.huggingface.co"
 
 PRODUCT_GROUPS = {
     "Piping & Fittings": ["FLANGE", "PIPE", "ELBOW", "TEE", "UNION", "REDUCER", "BEND", "COUPLING", "NIPPLE", "BUSHING", "UPVC", "CPVC", "PVC"],
@@ -127,11 +59,181 @@ SPEC_TRAPS = {
     "Rating": ["150#", "300#", "600#", "PN10", "PN16", "PN25", "PN40"]
 }
 
-# --- AI UTILITIES ---
+# --- UTILITY FUNCTIONS ---
+def get_streamlit_secrets():
+    secrets_path = Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
+    if not secrets_path.exists():
+        return {}
+    try:
+        with secrets_path.open("rb") as handle:
+            return tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+def resolve_setting(key, default=None, as_bool=False):
+    value = os.getenv(key)
+    if value is None:
+        secrets = get_streamlit_secrets()
+        value = secrets.get(key)
+        if value is None:
+            try:
+                value = st.secrets.get(key)
+            except (AttributeError, KeyError):
+                value = None
+    
+    if value is None:
+        return default
+    
+    if as_bool:
+        if isinstance(value, bool): return value
+        return str(value).strip().lower() == "true"
+    return str(value).strip()
+
+# --- AI CONNECTIVITY BACKEND (REFACTORED) ---
+class InventoryAIBackend:
+    """
+    Encapsulates all Hugging Face API interactions, connection checks, 
+    token management, and retry logic.
+    """
+    def __init__(self):
+        self.enabled = resolve_setting("ENABLE_HF_MODELS", default=False, as_bool=True)
+        self.token = self._resolve_token()
+        self.client = InferenceClient(token=self.token, timeout=HF_INFERENCE_TIMEOUT) if self.token else None
+        self.status = {"zero_shot": False, "embeddings": False, "reason": "init", "detail": ""}
+
+    def _resolve_token(self):
+        keys = ["HF_TOKEN", "HUGGINGFACEHUB_API_TOKEN", "HUGGINGFACE_API_TOKEN"]
+        for k in keys:
+            t = resolve_setting(k)
+            if t and t.startswith("hf_") and len(t) >= 20:
+                return t
+        return None
+
+    def _check_network(self):
+        """Low-level network diagnostic."""
+        try:
+            socket.gethostbyname(HF_API_HOSTNAME)
+        except Exception:
+            return False, "DNS Resolution Failed"
+        
+        try:
+            with socket.create_connection((HF_API_HOSTNAME, 443), timeout=5):
+                return True, "OK"
+        except Exception as e:
+            return False, f"TCP Connect Failed: {str(e)}"
+
+    def _execute_with_retry(self, func, retries=2, delay=2):
+        """Exponential backoff for transient API errors."""
+        try:
+            return func()
+        except (InferenceTimeoutError, RateLimitError, HfHubHTTPError) as e:
+            should_retry = False
+            if isinstance(e, (InferenceTimeoutError, RateLimitError)):
+                should_retry = True
+            elif isinstance(e, HfHubHTTPError) and e.response.status_code in [429, 503, 504]:
+                should_retry = True
+            
+            # Check for loading state messages
+            err_str = str(e).lower()
+            if "loading" in err_str:
+                should_retry = True
+            
+            if should_retry and retries > 0:
+                time.sleep(delay)
+                return self._execute_with_retry(func, retries - 1, delay * 2)
+            raise e
+
+    @st.cache_data(ttl=HF_CONNECTION_CACHE_TTL)
+    def check_health(_self):  # _self prevents hashing the object
+        """Comprehensive health check returns a dict for the UI."""
+        if not _self.enabled:
+            return {"enabled": False, "status": "disabled", "reason": "disabled"}
+        if not _self.token:
+            return {"enabled": False, "status": "missing_token", "reason": "Token not found or invalid"}
+
+        net_ok, net_msg = _self._check_network()
+        if not net_ok:
+            return {"enabled": False, "status": "network_error", "reason": net_msg}
+
+        # Functional Tests
+        zs_ok, emb_ok = False, False
+        test_text = "Inventory Audit Check"
+        
+        try:
+            _self._execute_with_retry(lambda: _self.client.feature_extraction(test_text, model=HF_EMBEDDING_MODEL))
+            emb_ok = True
+        except Exception: pass
+
+        try:
+            _self._execute_with_retry(lambda: _self.client.zero_shot_classification(test_text, list(PRODUCT_GROUPS.keys())[:3]))
+            zs_ok = True
+        except Exception: pass
+
+        if zs_ok and emb_ok:
+            status = "connected"
+        elif zs_ok or emb_ok:
+            status = "partial"
+        else:
+            status = "api_error"
+
+        return {
+            "enabled": True,
+            "status": status,
+            "zero_shot": zs_ok,
+            "embeddings": emb_ok,
+            "reason": "All systems go" if status == "connected" else "Some models failed"
+        }
+
+    def get_zero_shot(self, texts, labels):
+        if not self.token: return None
+        if isinstance(texts, str): texts = [texts]
+        
+        results = []
+        try:
+            for i in range(0, len(texts), HF_BATCH_SIZE):
+                batch = texts[i:i + HF_BATCH_SIZE]
+                batch_res = self._execute_with_retry(
+                    lambda: self.client.zero_shot_classification(
+                        batch, labels, hypothesis_template="This industrial inventory item is {}"
+                    )
+                )
+                if isinstance(batch_res, dict): batch_res = [batch_res]
+                results.extend(batch_res)
+            return results
+        except Exception as e:
+            st.warning(f"Zero-Shot classification failed: {str(e)}")
+            return None
+
+    def get_embeddings(self, texts):
+        if not self.token: return None
+        try:
+            raw_embeds = []
+            for i in range(0, len(texts), HF_BATCH_SIZE):
+                batch = texts[i:i + HF_BATCH_SIZE]
+                res = self._execute_with_retry(
+                    lambda: self.client.feature_extraction(batch, model=HF_EMBEDDING_MODEL)
+                )
+                # Handle single vs batch return
+                if isinstance(res, list) and res and isinstance(res[0], float):
+                    res = [res]
+                raw_embeds.extend(res)
+            
+            # Normalize
+            embeddings = np.array(raw_embeds, dtype=float)
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            norms[norms == 0] = 1
+            return embeddings / norms
+        except Exception as e:
+            st.warning(f"Embedding generation failed: {str(e)}")
+            return None
+
+# Initialize Backend
+ai_backend = InventoryAIBackend()
+
+# --- BUSINESS LOGIC (PRESERVED) ---
 def clean_description(text):
     text = str(text).upper().replace('"', ' ')
-    text = text.replace("O-RING", "O RING")
-    text = text.replace("MECH-SEAL", "MECHANICAL SEAL").replace("MECH SEAL", "MECHANICAL SEAL")
+    text = text.replace("O-RING", "O RING").replace("MECH-SEAL", "MECHANICAL SEAL").replace("MECH SEAL", "MECHANICAL SEAL")
     text = re.sub(r'[^A-Z0-9\s./-]', ' ', text)
     return re.sub(r'\s+', ' ', text).strip()
 
@@ -148,9 +250,11 @@ def get_tech_dna(text):
 
 def intelligent_noun_extractor(text):
     text = clean_description(text)
+    # Priority phrases
     phrases = ["MEASURING TAPE", "BALL VALVE", "GATE VALVE", "PLUG VALVE", "CHECK VALVE", "MECHANICAL SEAL", "PAINT BRUSH", "WIRE STRIPPER", "CUTTING PLIER", "DRILL BIT"]
     for p in phrases:
         if re.search(token_pattern(p), text): return p
+    # Noun Knowledge Base
     all_nouns = [item for sublist in PRODUCT_GROUPS.values() for item in sublist]
     for n in all_nouns:
         if re.search(token_pattern(n), text): return n
@@ -158,35 +262,26 @@ def intelligent_noun_extractor(text):
 
 def map_product_group(noun):
     for group, keywords in PRODUCT_GROUPS.items():
-        if noun in keywords:
-            return group
+        if noun in keywords: return group
     for group, keywords in PRODUCT_GROUPS.items():
         for keyword in keywords:
-            if re.search(token_pattern(keyword), noun):
-                return group
+            if re.search(token_pattern(keyword), noun): return group
     return DEFAULT_PRODUCT_GROUP
 
 def dominant_group(series):
     counts = series.value_counts()
     return counts.idxmax() if not counts.empty else "UNMAPPED"
 
-def apply_distance_floor(distances, min_threshold=MIN_DISTANCE_THRESHOLD):
+def apply_distance_floor(distances, min_threshold=1e-8):
     max_dist = np.max(distances, axis=1)
     return np.where(max_dist == 0, min_threshold, max_dist)
 
 def normalize_confidence_scores(scores):
-    if not isinstance(scores, pd.Series):
-        scores = pd.Series(scores)
-    if scores.empty:
-        return scores
-    max_score = scores.max()
-    if max_score >= HF_CONFIDENCE_MIN_THRESHOLD:
-        return scores
-    min_score = scores.min()
-    if max_score == min_score:
-        return pd.Series(np.full(len(scores), max(max_score, HF_CONFIDENCE_MIN_TARGET)), index=scores.index)
-    scaled = (scores - min_score) / (max_score - min_score)
-    return (scaled * (HF_CONFIDENCE_MAX_TARGET - HF_CONFIDENCE_MIN_TARGET) + HF_CONFIDENCE_MIN_TARGET).round(4)
+    if scores.empty: return scores
+    min_s, max_s = scores.min(), scores.max()
+    if max_s >= 0.8: return scores
+    if max_s == min_s: return pd.Series(np.full(len(scores), max(max_s, 0.6)), index=scores.index)
+    return ((scores - min_s) / (max_s - min_s) * (0.98 - 0.6) + 0.6).round(4)
 
 def build_fuzzy_duplicates(df, id_col):
     fuzzy_list = []
@@ -194,12 +289,11 @@ def build_fuzzy_duplicates(df, id_col):
     for i in range(len(recs)):
         for j in range(i + 1, min(i + COMPARISON_WINDOW_SIZE, len(recs))):
             r1, r2 = recs[i], recs[j]
-            desc1 = r1.get('Standard_Desc') or ''
-            desc2 = r2.get('Standard_Desc') or ''
+            desc1, desc2 = r1.get('Standard_Desc', ''), r2.get('Standard_Desc', '')
             sim = SequenceMatcher(None, desc1, desc2).ratio()
             if sim > FUZZY_SIMILARITY_THRESHOLD:
-                dna1 = r1.get('Tech_DNA') or {'numbers': set(), 'attributes': {}}
-                dna2 = r2.get('Tech_DNA') or {'numbers': set(), 'attributes': {}}
+                dna1 = r1.get('Tech_DNA', {'numbers': set(), 'attributes': {}})
+                dna2 = r2.get('Tech_DNA', {'numbers': set(), 'attributes': {}})
                 is_variant = (dna1['numbers'] != dna2['numbers']) or (dna1['attributes'] != dna2['attributes'])
                 fuzzy_list.append({
                     'ID A': r1[id_col], 'ID B': r2[id_col],
@@ -208,401 +302,69 @@ def build_fuzzy_duplicates(df, id_col):
                 })
     return fuzzy_list
 
-def get_hf_secret(key):
-    secrets = get_streamlit_secrets()
-    if key in secrets:
-        return secrets[key]
-    try:
-        return st.secrets[key]
-    except (AttributeError, KeyError):
-        return None
-
-def get_hf_token():
-    for key in HF_TOKEN_KEYS:
-        token = os.getenv(key) or get_hf_secret(key)
-        if token:
-            token = str(token).strip()
-            if token:
-                return token
-    return None
-
-def validate_hf_token(token):
-    """Validate that the token looks like a valid Hugging Face token."""
-    if not token:
-        return False
-    token = str(token).strip()
-    # HF tokens typically start with 'hf_' and must meet minimum length requirement
-    if not token.startswith('hf_'):
-        return False
-    if len(token) < HF_TOKEN_MIN_LENGTH:
-        return False
-    return True
-
-def check_dns_resolution(hostname):
-    """Check if a hostname can be resolved via DNS."""
-    try:
-        socket.gethostbyname(hostname)
-        return True
-    except (socket.gaierror, socket.herror, OSError):
-        return False
-
-def check_hf_api_connectivity():
-    """
-    Check if Hugging Face API is accessible.
-    Returns a tuple: (is_accessible, error_message)
-    """
-    hostname = HF_API_HOSTNAME
-    
-    # First check DNS resolution
-    if not check_dns_resolution(hostname):
-        return False, "dns_resolution_failed"
-    
-    # Try to establish a connection
-    sock = None
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5)
-        sock.connect((hostname, 443))
-        return True, None
-    except socket.timeout:
-        return False, "connection_timeout"
-    except (socket.gaierror, socket.herror):
-        return False, "dns_resolution_failed"
-    except ConnectionRefusedError:
-        return False, "connection_refused"
-    except OSError as e:
-        return False, f"network_error: {str(e)}"
-    finally:
-        if sock:
-            try:
-                sock.close()
-            except (OSError, socket.error):
-                # Ignore errors during cleanup
-                pass
-
-def execute_hf_with_backoff(func, warning_message, retries=0):
-    """
-    Helper wrapper to execute InferenceClient functions with exponential backoff 
-    matching the original logic.
-    """
-    try:
-        return func()
-    except (InferenceTimeoutError, RateLimitError, HfHubHTTPError) as e:
-        # Determine if retryable based on original logic or library exceptions
-        is_retryable = False
-        
-        # Library exceptions that imply retry
-        if isinstance(e, (InferenceTimeoutError, RateLimitError)):
-            is_retryable = True
-        elif isinstance(e, HfHubHTTPError):
-            # 503 is Service Unavailable (often loading), 429 is Rate Limit
-            if e.response.status_code in [429, 503, 504]:
-                is_retryable = True
-            # Check text patterns for "loading"
-            if any(p in str(e).lower() for p in HF_MODEL_LOADING_PATTERNS):
-                is_retryable = True
-        
-        # Fallback generic exception check for loading strings
-        if any(p in str(e).lower() for p in HF_MODEL_LOADING_PATTERNS):
-            is_retryable = True
-
-        if is_retryable and retries < HF_MAX_RETRIES:
-            # Exponential backoff with maximum delay cap
-            delay = min(HF_RETRY_DELAY * (2 ** retries), HF_MAX_RETRY_DELAY)
-            time.sleep(delay)
-            return execute_hf_with_backoff(func, warning_message, retries + 1)
-        
-        st.warning(f"{warning_message}: API returned error - {str(e)}")
-        return None
-    except Exception as e:
-        # Generic catch-all for other library issues
-        if any(p in str(e).lower() for p in HF_MODEL_LOADING_PATTERNS) and retries < HF_MAX_RETRIES:
-            delay = min(HF_RETRY_DELAY * (2 ** retries), HF_MAX_RETRY_DELAY)
-            time.sleep(delay)
-            return execute_hf_with_backoff(func, warning_message, retries + 1)
-            
-        st.warning(f"{warning_message}: {str(e)}")
-        return None
-
-def run_hf_zero_shot(texts, labels):
-    token = get_hf_token()
-    if not token:
-        st.warning("Hugging Face token missing; skipping hosted classification.")
-        return None
-    if isinstance(texts, str):
-        texts = [texts]
-    
-    try:
-        client = InferenceClient(token=token, timeout=HF_INFERENCE_TIMEOUT)
-        results = []
-        for start in range(0, len(texts), HF_BATCH_SIZE):
-            batch = texts[start:start + HF_BATCH_SIZE]
-            
-            # Define the call for the batch
-            def _call():
-                return client.zero_shot_classification(
-                    batch, 
-                    labels, 
-                    hypothesis_template="This industrial inventory item is {}"
-                )
-            
-            batch_results = execute_hf_with_backoff(
-                _call,
-                "Hugging Face classification failed; using existing categories."
-            )
-            
-            if not batch_results:
-                return None
-            
-            # Ensure list consistency
-            if isinstance(batch_results, dict):
-                batch_results = [batch_results]
-            results.extend(batch_results)
-            
-        return results
-    except Exception:
-        st.warning("Hugging Face classification failed; using existing categories.")
-        return None
-
-def compute_embeddings(texts):
-    token = get_hf_token()
-    if not token:
-        st.warning("Hugging Face token missing; skipping hosted embeddings.")
-        return None
-    
-    try:
-        client = InferenceClient(token=token, timeout=HF_INFERENCE_TIMEOUT)
-        embeddings = []
-        for start in range(0, len(texts), HF_BATCH_SIZE):
-            batch = texts[start:start + HF_BATCH_SIZE]
-            
-            def _call():
-                return client.feature_extraction(batch, model=HF_EMBEDDING_MODEL)
-                
-            batch_embeddings = execute_hf_with_backoff(
-                _call,
-                "Embedding generation failed; falling back to TF-IDF signals."
-            )
-            
-            if batch_embeddings is None:
-                return None
-                
-            # Handle variable return types from the library (list vs ndarray)
-            if isinstance(batch_embeddings, list) and len(batch_embeddings) > 0:
-                 if isinstance(batch_embeddings[0], (int, float)):
-                     # Single embedding returned as flat list
-                     batch_embeddings = [batch_embeddings]
-            
-            embeddings.extend(batch_embeddings)
-            
-        embeddings = np.array(embeddings, dtype=float)
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        norms[norms == 0] = 1
-        return embeddings / norms
-    except Exception:
-        st.warning("Embedding generation failed; falling back to TF-IDF signals.")
-        return None
-
-def is_valid_zero_shot_item(item):
-    if not isinstance(item, dict):
-        return False
-    labels = item.get("labels")
-    scores = item.get("scores")
-    return isinstance(labels, list) and isinstance(scores, list) and bool(labels) and bool(scores)
-
-def is_valid_zero_shot_response(result):
-    if isinstance(result, dict):
-        return is_valid_zero_shot_item(result)
-    if isinstance(result, list) and result:
-        return all(is_valid_zero_shot_item(item) for item in result)
-    return False
-
-def is_valid_embedding_response(result):
-    if not isinstance(result, (list, np.ndarray)) or len(result) == 0:
-        return False
-    # Check first item
-    first = result[0]
-    if isinstance(first, (int, float)):
-        return True
-    if isinstance(first, (list, np.ndarray)) and len(first) > 0:
-        return all(isinstance(x, (int, float)) for x in first)
-    return False
-
-@st.cache_data(ttl=HF_CONNECTION_CACHE_TTL)
-def test_hf_inference_connection(enable_hf_models):
-    """
-    Test connection to Hugging Face Inference API with comprehensive diagnostics.
-    Returns a dict with connection status and detailed error information.
-    """
-    if not enable_hf_models:
-        return {
-            "enabled": False,
-            "zero_shot": False,
-            "embeddings": False,
-            "reason": "disabled",
-            "status": "disabled",
-            "error_detail": None
-        }
-    
-    # Check if token exists
-    token = get_hf_token()
-    if not token:
-        return {
-            "enabled": False,
-            "zero_shot": False,
-            "embeddings": False,
-            "reason": "missing_token",
-            "status": "missing_token",
-            "error_detail": "No Hugging Face token found in environment or secrets"
-        }
-    
-    # Validate token format
-    if not validate_hf_token(token):
-        return {
-            "enabled": False,
-            "zero_shot": False,
-            "embeddings": False,
-            "reason": "invalid_token",
-            "status": "invalid_token",
-            "error_detail": f"Token format is invalid (should start with 'hf_' and be at least {HF_TOKEN_MIN_LENGTH} characters)"
-        }
-    
-    # Check network connectivity to HF API
-    is_accessible, conn_error = check_hf_api_connectivity()
-    if not is_accessible:
-        error_details = {
-            "dns_resolution_failed": f"Cannot resolve {HF_API_HOSTNAME} - May be blocked by firewall or network policy",
-            "connection_timeout": "Connection timeout - Network may be slow or API unreachable",
-            "connection_refused": "Connection refused - Service may be down or blocked",
-        }
-        error_detail = error_details.get(conn_error, f"Network connectivity issue: {conn_error}")
-        
-        return {
-            "enabled": False,
-            "zero_shot": False,
-            "embeddings": False,
-            "reason": "network_unreachable",
-            "status": "network_unreachable",
-            "error_detail": error_detail,
-            "connectivity_error": conn_error
-        }
-    
-    # Test with Hub Library
-    try:
-        client = InferenceClient(token=token, timeout=HF_INFERENCE_TIMEOUT)
-        test_text = HF_CONNECTION_TEST_TEXT
-        
-        # Test Zero Shot
-        def _test_zs():
-            return client.zero_shot_classification(
-                test_text, 
-                list(PRODUCT_GROUPS.keys()), 
-                hypothesis_template="This industrial inventory item is {}"
-            )
-        zero_shot_result = execute_hf_with_backoff(_test_zs, "HF Zero Shot Test Failed")
-        zero_shot_ok = is_valid_zero_shot_response(zero_shot_result)
-        
-        # Test Embeddings
-        def _test_emb():
-            return client.feature_extraction(test_text, model=HF_EMBEDDING_MODEL)
-        embedding_result = execute_hf_with_backoff(_test_emb, "HF Embedding Test Failed")
-        embedding_ok = is_valid_embedding_response(embedding_result)
-        
-    except Exception as e:
-        zero_shot_ok = False
-        embedding_ok = False
-        error_detail = str(e)
-    else:
-        error_detail = None
-    
-    # Determine overall status
-    if zero_shot_ok and embedding_ok:
-        status = "full"
-        error_detail = None
-    elif zero_shot_ok or embedding_ok:
-        status = "partial"
-        failed_models = []
-        if not zero_shot_ok:
-            failed_models.append("zero-shot classification")
-        if not embedding_ok:
-            failed_models.append("embeddings")
-        error_detail = f"Some models unavailable: {', '.join(failed_models)}"
-    else:
-        status = "unavailable"
-        if not error_detail:
-            error_detail = "Both zero-shot classification and embedding models failed to respond"
-    
-    enabled = status in {"full", "partial"}
-    reason = None if enabled else "inference_test_failed"
-    
-    return {
-        "enabled": enabled,
-        "zero_shot": zero_shot_ok,
-        "embeddings": embedding_ok,
-        "reason": reason,
-        "status": status,
-        "error_detail": error_detail
-    }
-
 # --- MAIN ENGINE ---
 @st.cache_data
-def run_intelligent_audit(file_path, enable_hf_zero_shot=False, enable_hf_embeddings=False):
+def run_intelligent_audit(file_path, _ai_health):
     df = pd.read_csv(file_path, encoding='latin1')
     df.columns = [c.strip() for c in df.columns]
+    
+    # ID/Desc Column Discovery
     id_col = next(c for c in df.columns if any(x in c.lower() for x in ['item', 'no']))
     desc_col = next(c for c in df.columns if 'desc' in c.lower())
     
+    # 1. Processing
     df['Standard_Desc'] = df[desc_col].apply(clean_description)
+    df['Tech_DNA'] = df['Standard_Desc'].apply(get_tech_dna)
     df['Part_Noun'] = df['Standard_Desc'].apply(intelligent_noun_extractor)
     df['Product_Group'] = df['Part_Noun'].apply(map_product_group)
 
-    # NLP & Topic Modeling
+    # 2. Local TF-IDF Clustering
     tfidf = TfidfVectorizer(max_features=300, stop_words='english')
     tfidf_matrix = tfidf.fit_transform(df['Standard_Desc'])
     
-    # Clustering for Confidence
     kmeans = KMeans(n_clusters=8, random_state=42, n_init=10)
     df['Cluster_ID'] = kmeans.fit_predict(tfidf_matrix)
     dists = kmeans.transform(tfidf_matrix)
     max_tfidf_dist = apply_distance_floor(dists)
     df['Confidence'] = (1 - (np.min(dists, axis=1) / max_tfidf_dist)).round(4)
+    
     cluster_groups = df.groupby('Cluster_ID')['Product_Group'].agg(dominant_group)
     df['Cluster_Group'] = df['Cluster_ID'].map(cluster_groups)
     df['Cluster_Validated'] = df['Product_Group'] == df['Cluster_Group']
     
-    # Anomaly
+    # 3. Local Anomaly (TF-IDF)
     iso = IsolationForest(contamination=0.04, random_state=42)
-    df['Anomaly_Flag'] = iso.fit_predict(tfidf_matrix) # Using tfidf for complexity-based anomalies
+    df['Anomaly_Flag'] = iso.fit_predict(tfidf_matrix)
 
-    standard_desc = df['Standard_Desc'].tolist() if enable_hf_embeddings else None
-    hf_inputs = (
-        df['Part_Noun']
-        .fillna('')
-        .str.cat(df['Standard_Desc'].fillna(''), sep=' ')
-        .str.replace(r'\s+', ' ', regex=True)
-        .str.strip()
-        .tolist()
-        if enable_hf_zero_shot else None
-    )
+    # 4. Hugging Face Integation
+    enable_zs = _ai_health.get("zero_shot", False)
+    enable_emb = _ai_health.get("embeddings", False)
 
-    # Hugging Face Zero-Shot Classification
-    hf_results = run_hf_zero_shot(hf_inputs, list(PRODUCT_GROUPS.keys())) if enable_hf_zero_shot else None
+    # Prepare inputs
+    hf_inputs = df['Part_Noun'].fillna('').str.cat(df['Standard_Desc'].fillna(''), sep=' ').tolist() if enable_zs else None
+    
+    # Zero-Shot Call
+    hf_results = ai_backend.get_zero_shot(hf_inputs, list(PRODUCT_GROUPS.keys())) if enable_zs else None
+    
     if hf_results:
         df['HF_Product_Group'] = [res['labels'][0] for res in hf_results]
         df['HF_Product_Confidence'] = [round(res['scores'][0], 4) for res in hf_results]
     else:
         df['HF_Product_Group'] = df['Product_Group']
         df['HF_Product_Confidence'] = df['Confidence']
+    
     df['HF_Product_Confidence'] = normalize_confidence_scores(df['HF_Product_Confidence'])
 
-    # Hugging Face Embeddings for Clustering/Anomaly
-    embeddings = compute_embeddings(standard_desc) if enable_hf_embeddings else None
+    # Embedding Call
+    embeddings = ai_backend.get_embeddings(df['Standard_Desc'].tolist()) if enable_emb else None
+    
     if embeddings is not None:
         kmeans_hf = KMeans(n_clusters=8, random_state=42, n_init=10)
         df['HF_Cluster_ID'] = kmeans_hf.fit_predict(embeddings)
         hf_dists = kmeans_hf.transform(embeddings)
         max_dist = apply_distance_floor(hf_dists)
         df['HF_Cluster_Confidence'] = (1 - (np.min(hf_dists, axis=1) / max_dist)).round(4)
+        
         iso_hf = IsolationForest(contamination=0.04, random_state=42)
         df['HF_Anomaly_Flag'] = iso_hf.fit_predict(embeddings)
         df['HF_Embedding'] = list(embeddings)
@@ -612,415 +374,135 @@ def run_intelligent_audit(file_path, enable_hf_zero_shot=False, enable_hf_embedd
         df['HF_Anomaly_Flag'] = df['Anomaly_Flag']
         df['HF_Embedding'] = [None] * len(df)
 
-    # Fuzzy & Tech DNA
-    df['Tech_DNA'] = df['Standard_Desc'].apply(get_tech_dna)
-
     return df, id_col, desc_col
 
-# --- DATA LOADING ---
-hf_status = test_hf_inference_connection(ENABLE_HF_MODELS)
+# --- DATA LOADING & HEALTH ---
+ai_health = ai_backend.check_health()
 target_file = 'raw_data.csv'
+
 if os.path.exists(target_file):
-    df_raw, id_col, desc_col = run_intelligent_audit(
-        target_file,
-        enable_hf_zero_shot=hf_status["zero_shot"],
-        enable_hf_embeddings=hf_status["embeddings"]
-    )
+    df_raw, id_col, desc_col = run_intelligent_audit(target_file, ai_health)
 else:
     st.error("Data file missing from repository. Please ensure 'raw_data.csv' is present.")
     st.stop()
 
-# Filter defaults
-group_options = list(PRODUCT_GROUPS.keys())
-
-# --- HEADER & MODERN NAVIGATION ---
+# --- HEADER & NAVIGATION ---
 st.title("🛡️ AI Inventory Auditor Pro")
 st.markdown("### Advanced Inventory Intelligence & Quality Management")
 
-# Display HF connection status with detailed messaging
-if hf_status["enabled"]:
-    enabled_features = []
-    if hf_status["zero_shot"]:
-        enabled_features.append("zero-shot classification")
-    if hf_status["embeddings"]:
-        enabled_features.append("embeddings")
-    feature_label = ", ".join(enabled_features)
-    status_label = hf_status.get("status", "partial")
-    if status_label not in {"full", "partial"}:
-        status_label = "partial"
-    st.success(f"✅ Hugging Face Inference API connected ({status_label}: {feature_label}).")
-    
-    # Show warning if partial connectivity
-    if status_label == "partial" and hf_status.get("error_detail"):
-        st.info(f"ℹ️ Note: {hf_status['error_detail']}")
+# Status Banner
+status_cols = st.columns([3, 1])
+with status_cols[0]:
+    if ai_health["status"] == "connected":
+        st.success(f"✅ AI Connected (Zero-Shot & Embeddings Active)")
+    elif ai_health["status"] == "partial":
+        st.warning(f"⚠️ Partial AI Connectivity: {ai_health.get('reason')}")
+    elif ai_health["status"] == "disabled":
+        st.info("ℹ️ Hosted AI Disabled (Using Local ML)")
+    else:
+        st.error(f"❌ AI Connection Failed: {ai_health.get('reason')}")
 
-elif hf_status["reason"] == "disabled":
-    st.info("ℹ️ **Hugging Face models disabled.** Using local ML models for analysis.\n\n"
-            "To enable hosted inference:\n"
-            "- Set `ENABLE_HF_MODELS=true` in environment or `.streamlit/secrets.toml`\n"
-            "- Provide a token via `HF_TOKEN` environment variable or secrets")
+group_options = list(PRODUCT_GROUPS.keys())
+page = st.tabs(["📈 Executive Dashboard", "📍 Categorization Audit", "🚨 Quality Hub", "🧠 Technical Methodology", "🧭 My Approach"])
 
-elif hf_status["reason"] == "missing_token":
-    st.warning("⚠️ **Hugging Face token missing.** Using local signals instead of hosted inference.\n\n"
-               "To enable hosted models:\n"
-               "- Obtain a token from https://huggingface.co/settings/tokens\n"
-               "- Set via environment variable: `HF_TOKEN=your_token`\n"
-               "- Or add to `.streamlit/secrets.toml`: `HF_TOKEN = \"your_token\"`")
-
-elif hf_status["reason"] == "invalid_token":
-    st.warning("⚠️ **Hugging Face token format is invalid.** Using local signals instead.\n\n"
-               f"Details: {hf_status.get('error_detail', 'Token validation failed')}\n\n"
-               "Valid tokens should:\n"
-               "- Start with 'hf_'\n"
-               f"- Be at least {HF_TOKEN_MIN_LENGTH} characters long\n"
-               "- Obtain from https://huggingface.co/settings/tokens")
-
-elif hf_status["reason"] == "network_unreachable":
-    st.error("🚫 **Cannot reach Hugging Face API.** Using local signals instead.\n\n"
-             f"**Issue:** {hf_status.get('error_detail', 'Network connectivity problem')}\n\n"
-             "**Possible causes:**\n"
-             f"- Corporate firewall blocking {HF_API_HOSTNAME}\n"
-             "- Network policy restrictions\n"
-             "- DNS resolution issues\n"
-             "- Internet connectivity problems\n\n"
-             "**Resolution:**\n"
-             f"- Contact your network administrator to whitelist {HF_API_HOSTNAME}\n"
-             "- Check your network/firewall settings\n"
-             "- Verify internet connectivity")
-
-else:
-    # Generic failure
-    error_detail = hf_status.get('error_detail', 'Connection test failed')
-    st.warning(f"⚠️ **Hugging Face Inference API connection test failed.** Using local signals instead.\n\n"
-               f"Details: {error_detail}\n\n"
-               "The application will continue using local ML models for analysis.")
-
-# Modern horizontal tab navigation
-page = st.tabs(["📈 Executive Dashboard", "📍 Categorization Audit", "🚨 Quality Hub (Anomalies/Dups)", "🧠 Technical Methodology", "🧭 My Approach"])
-
-# --- PAGE: EXECUTIVE DASHBOARD ---
+# --- PAGE 1: EXECUTIVE DASHBOARD ---
 with page[0]:
     st.markdown("#### 📊 Inventory Health Overview")
-    st.markdown("Get a bird's eye view of your inventory data quality and distribution.")
-    
-    # Filters at the top
-    with st.container():
-        st.markdown("##### 🔍 Filters")
-        selected_group = st.multiselect("Product Category", options=group_options, default=group_options, key="dash_group")
-    
-    # Apply Filters
+    selected_group = st.multiselect("Product Category", options=group_options, default=group_options, key="dash_group")
     df = df_raw[df_raw['Product_Group'].isin(selected_group)]
-    
     st.markdown("---")
     
-    # KPI Row
     fuzzy_list = build_fuzzy_duplicates(df, id_col)
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     kpi1.metric("📦 SKUs Analyzed", len(df))
     kpi2.metric("🎯 Mean HF Confidence", f"{df['HF_Product_Confidence'].mean():.1%}")
-    kpi3.metric("⚠️ HF Anomalies Found", len(df[df['HF_Anomaly_Flag'] == -1]))
+    kpi3.metric("⚠️ HF Anomalies", len(df[df['HF_Anomaly_Flag'] == -1]))
     kpi4.metric("🔄 Duplicate Pairs", len(fuzzy_list))
 
-    st.markdown("---")
-    
     col1, col2 = st.columns(2)
     with col1:
-        fig_pie = px.pie(df, names='HF_Product_Group', title="Inventory Distribution by HF Product Category", hole=0.4)
-        st.plotly_chart(fig_pie, use_container_width=True)
+        st.plotly_chart(px.pie(df, names='HF_Product_Group', title="Inventory Distribution", hole=0.4), use_container_width=True)
     with col2:
         top_nouns = df['Part_Noun'].value_counts().head(10).reset_index()
-        fig_bar = px.bar(top_nouns, x='Part_Noun', y='count', title="Top 10 Product Categories", labels={'Part_Noun':'Product', 'count':'Qty'})
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(px.bar(top_nouns, x='Part_Noun', y='count', title="Top 10 Products"), use_container_width=True)
 
     # Health Gauge
     health_val = (len(df[df['HF_Anomaly_Flag'] == 1]) / len(df)) * 100
-    fig_gauge = go.Figure(go.Indicator(
-        mode = "gauge+number",
-        value = health_val,
-        title = {'text': "Catalog Data Accuracy %"},
+    st.plotly_chart(go.Figure(go.Indicator(
+        mode = "gauge+number", value = health_val, title = {'text': "Catalog Data Accuracy %"},
         gauge = {'axis': {'range': [0, 100]}, 'bar': {'color': "#00cc96"}}
-    ))
-    st.plotly_chart(fig_gauge, use_container_width=True)
+    )), use_container_width=True)
 
-    st.markdown("#### 💼 Business Insights")
-    insights = (
-        df.groupby('HF_Product_Group', dropna=False)
-        .agg(
-            Items=(id_col, 'count'),
-            Mean_HF_Confidence=('HF_Product_Confidence', 'mean'),
-            HF_Anomaly_Rate=('HF_Anomaly_Flag', lambda x: (x == -1).mean())
-        )
-        .reset_index()
-        .sort_values('Items', ascending=False)
-    )
-    insights['Mean_HF_Confidence'] = insights['Mean_HF_Confidence'].round(3)
-    insights['HF_Anomaly_Rate'] = insights['HF_Anomaly_Rate'].round(3)
-    st.dataframe(insights, use_container_width=True, height=260)
-    fig_insights = px.bar(
-        insights.head(10),
-        x='HF_Product_Group',
-        y='Mean_HF_Confidence',
-        title="Top HF Categories by Confidence",
-        labels={'HF_Product_Group': 'HF Category', 'Mean_HF_Confidence': 'Mean Confidence'}
-    )
-    st.plotly_chart(fig_insights, use_container_width=True)
-
-# --- PAGE: CATEGORIZATION AUDIT ---
+# --- PAGE 2: CATEGORIZATION AUDIT ---
 with page[1]:
-    st.markdown("#### 📍 AI Categorization & Filtered Audit")
-    st.markdown("Drill down into specific product categories with intelligent filtering.")
-    
-    # Filters at the top of the table
-    with st.container():
-        st.markdown("##### 🔍 Filters")
-        selected_group = st.multiselect("Product Category", options=group_options, default=group_options, key="cat_group")
-    
-    # Apply Filters
+    st.markdown("#### 📍 AI Categorization Audit")
+    selected_group = st.multiselect("Product Category", options=group_options, default=group_options, key="cat_group")
     df = df_raw[df_raw['Product_Group'].isin(selected_group)]
     
-    st.markdown("---")
-    st.markdown(f"**Showing {len(df)} items**")
-    
-    # Data Table with sorting
-    st.dataframe(
-        df[
-            [
-                id_col,
-                'Standard_Desc',
-                'Part_Noun',
-                'Product_Group',
-                'HF_Product_Group',
-                'HF_Product_Confidence',
-                'Confidence'
-            ]
-        ].sort_values('HF_Product_Confidence', ascending=False),
-        use_container_width=True,
-        height=400
-    )
-    
-    summary = (
-        df.groupby('Product_Group', dropna=False)
-        .agg(
-            Items=(id_col, 'count'),
-            Mean_Confidence=('Confidence', 'mean'),
-            Mean_HF_Confidence=('HF_Product_Confidence', 'mean'),
-            Cluster_Match_Rate=('Cluster_Validated', 'mean')
-        )
-        .reset_index()
-        .sort_values('Items', ascending=False)
-    )
-    summary['Mean_Confidence'] = summary['Mean_Confidence'].round(3)
-    summary['Mean_HF_Confidence'] = summary['Mean_HF_Confidence'].round(3)
-    summary['Cluster_Match_Rate'] = summary['Cluster_Match_Rate'].round(3)
-    st.markdown("#### 📌 Category Distribution & Confidence")
-    st.dataframe(summary, use_container_width=True, height=260)
+    st.dataframe(df[[id_col, 'Standard_Desc', 'Part_Noun', 'Product_Group', 'HF_Product_Group', 'HF_Product_Confidence']].sort_values('HF_Product_Confidence'), use_container_width=True)
+    st.plotly_chart(px.histogram(df, x="HF_Product_Confidence", nbins=20, title="Confidence Distribution"), use_container_width=True)
 
-    # Distribution of confidence
-    fig_hist = px.histogram(df, x="HF_Product_Confidence", nbins=20, title="HF Confidence Score Distribution", color_discrete_sequence=['#636EFA'])
-    st.plotly_chart(fig_hist, use_container_width=True)
-
-# --- PAGE: QUALITY HUB ---
+# --- PAGE 3: QUALITY HUB ---
 with page[2]:
-    st.markdown("#### 🚨 Anomaly & Duplicate Identification")
-    st.markdown("Identify quality issues and potential duplicates in your inventory data.")
-    
-    # Filters at the top
-    with st.container():
-        st.markdown("##### 🔍 Filters")
-        selected_group = st.multiselect("Product Category", options=group_options, default=group_options, key="qual_group")
-    
-    # Apply Filters
+    st.markdown("#### 🚨 Quality Hub")
+    selected_group = st.multiselect("Product Category", options=group_options, default=group_options, key="qual_group")
     df = df_raw[df_raw['Product_Group'].isin(selected_group)]
     
-    st.markdown("---")
-    
-    t1, t2, t3 = st.tabs(["⚠️ HF Anomalies", "👯 Fuzzy Duplicates", "🧠 Semantic Duplicates"])
+    t1, t2, t3 = st.tabs(["⚠️ Anomalies", "👯 Fuzzy Duplicates", "🧠 Semantic Duplicates"])
     
     with t1:
-        st.subheader("HF Embedding Anomalies (Isolation Forest)")
-        anoms = df[df['HF_Anomaly_Flag'] == -1]
-        st.warning(f"Found {len(anoms)} anomalies in the current view.")
-        st.dataframe(
-            anoms[[id_col, desc_col, 'Part_Noun', 'HF_Product_Group', 'HF_Cluster_Confidence']],
-            use_container_width=True,
-            height=400
-        )
+        st.dataframe(df[df['HF_Anomaly_Flag'] == -1][[id_col, desc_col, 'HF_Product_Group', 'HF_Cluster_Confidence']], use_container_width=True)
         
     with t2:
-        st.subheader("Fuzzy Duplicate Audit (Spec-Aware)")
-        st.info("System identifies items with >85% text similarity but differentiates based on numeric specs (Size/Gender).")
+        fuzzy = build_fuzzy_duplicates(df, id_col)
+        if fuzzy: st.dataframe(pd.DataFrame(fuzzy), use_container_width=True)
+        else: st.success("No fuzzy duplicates found.")
         
-        # Calculate fuzzy duplicates for the current view
-        fuzzy_list = build_fuzzy_duplicates(df, id_col)
-        
-        if fuzzy_list:
-            st.dataframe(pd.DataFrame(fuzzy_list), use_container_width=True, height=400)
-        else:
-            st.success("No fuzzy duplicates found in this filtered view.")
-
     with t3:
-        st.subheader("Semantic Duplicate Audit (Sentence-Transformers)")
-        if df['HF_Embedding'].apply(lambda x: x is None).all():
-            st.info("Semantic duplicate detection unavailable (HF embeddings not loaded).")
+        if df['HF_Embedding'].iloc[0] is None:
+            st.info("Embeddings unavailable.")
         else:
-            records = df.reset_index(drop=True)
-            if records['HF_Embedding'].apply(lambda x: x is None).any():
-                st.info("Semantic duplicate detection unavailable (HF embeddings incomplete).")
-            else:
-                sem_list = []
-                recs = records.to_dict('records')
-                embeddings = records['HF_Embedding'].tolist()
-                window_size = COMPARISON_WINDOW_SIZE  # Keep comparisons lightweight for UI responsiveness.
-                for i in range(len(recs)):
-                    for j in range(i + 1, min(i + window_size, len(recs))):
-                        sim = float(np.dot(embeddings[i], embeddings[j]))  # Cosine similarity on normalized embeddings.
-                        if sim > SEMANTIC_SIMILARITY_THRESHOLD:
-                            sem_list.append({
-                                'ID A': recs[i][id_col],
-                                'ID B': recs[j][id_col],
-                                'Desc A': recs[i]['Standard_Desc'],
-                                'Desc B': recs[j]['Standard_Desc'],
-                                'Semantic Match %': f"{sim:.1%}"
-                            })
-                if sem_list:
-                    st.dataframe(pd.DataFrame(sem_list), use_container_width=True, height=400)
-                else:
-                    st.success("No semantic duplicates found in this filtered view.")
+            sem_list = []
+            recs = df.to_dict('records')
+            embeds = list(df['HF_Embedding'])
+            for i in range(len(recs)):
+                for j in range(i + 1, min(i + COMPARISON_WINDOW_SIZE, len(recs))):
+                    sim = float(np.dot(embeds[i], embeds[j]))
+                    if sim > SEMANTIC_SIMILARITY_THRESHOLD:
+                        sem_list.append({
+                            'ID A': recs[i][id_col], 'ID B': recs[j][id_col],
+                            'Desc A': recs[i]['Standard_Desc'], 'Desc B': recs[j]['Standard_Desc'],
+                            'Match %': f"{sim:.1%}"
+                        })
+            if sem_list: st.dataframe(pd.DataFrame(sem_list), use_container_width=True)
+            else: st.success("No semantic duplicates found.")
 
-# --- PAGE: METHODOLOGY ---
+# --- PAGE 4: METHODOLOGY ---
 with page[3]:
-    st.markdown("#### 🧠 Technical Methodology & AI Stack")
-    st.markdown("Understand the advanced algorithms powering this inventory intelligence system.")
+    st.markdown("#### 🧠 Technical Methodology")
+    st.markdown("### Connection Diagnostics")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Status", ai_health["status"])
+    c2.metric("Zero-Shot", "✅" if ai_health["zero_shot"] else "❌")
+    c3.metric("Embeddings", "✅" if ai_health["embeddings"] else "❌")
     
-    # Add Connection Diagnostics Section
-    with st.expander("🔍 Hugging Face Connection Diagnostics", expanded=False):
-        st.markdown("### Connection Status")
+    if ai_health["status"] != "connected":
+        st.error(f"Reason: {ai_health.get('reason')}")
         
-        # Display status overview
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            if hf_status["enabled"]:
-                st.metric("Status", "✅ Connected", delta=None)
-            else:
-                st.metric("Status", "❌ Disconnected", delta=None)
-        
-        with col2:
-            st.metric("Zero-Shot", "✅ OK" if hf_status["zero_shot"] else "❌ Failed")
-        
-        with col3:
-            st.metric("Embeddings", "✅ OK" if hf_status["embeddings"] else "❌ Failed")
-        
-        st.markdown("---")
-        
-        # Detailed diagnostics
-        st.markdown("### Diagnostic Details")
-        
-        # Token status
-        token = get_hf_token()
-        st.markdown(f"**Token Status:** {'✅ Present' if token else '❌ Missing'}")
-        if token:
-            is_valid = validate_hf_token(token)
-            st.markdown(f"**Token Validation:** {'✅ Valid format' if is_valid else '❌ Invalid format'}")
-        
-        # Network connectivity
-        st.markdown("**Network Tests:**")
-        dns_ok = check_dns_resolution(HF_API_HOSTNAME)
-        st.markdown(f"- DNS Resolution: {'✅ OK' if dns_ok else '❌ Failed'}")
-        
-        is_accessible, conn_error = check_hf_api_connectivity()
-        st.markdown(f"- TCP Connectivity: {'✅ OK' if is_accessible else '❌ Failed'}")
-        if conn_error:
-            st.markdown(f"  - Error: `{conn_error}`")
-        
-        # Overall reason
-        if hf_status.get("reason"):
-            st.markdown(f"**Overall Status:** `{hf_status['reason']}`")
-        
-        if hf_status.get("error_detail"):
-            st.markdown(f"**Error Details:** {hf_status['error_detail']}")
-        
-        # Configuration info
-        st.markdown("---")
-        st.markdown("### Configuration")
-        st.markdown(f"**ENABLE_HF_MODELS:** `{ENABLE_HF_MODELS}`")
-        st.markdown(f"**HF_INFERENCE_API_URL:** `{HF_INFERENCE_API_URL}`")
-        st.markdown(f"**HF_INFERENCE_TIMEOUT:** `{HF_INFERENCE_TIMEOUT}s`")
-        st.markdown(f"**Models:**")
-        st.markdown(f"- Zero-Shot: `{HF_ZERO_SHOT_MODEL}`")
-        st.markdown(f"- Embeddings: `{HF_EMBEDDING_MODEL}`")
-    
-    st.markdown("""
-    ### 1. Data Processing (ETL)
-    We standardize the raw 543 rows by stripping quote artifacts, uppercasing, and cleaning symbols. We utilize **RegEx** to extract technical specifications (Numbers, Sizes, Genders) into a "Technical DNA" profile for every part.
-    
-    ### 2. Intelligent Categorization
-    Instead of standard K-Means (which is biased by word frequency), we use a **Prioritized Knowledge Base** to anchor nouns to super-categories. We also run a cached Hugging Face **zero-shot classifier** (facebook/bart-large-mnli) to assign *HF_Product_Group* labels with confidence scores.
-    
-    ### 3. Cluster Validation
-    We validate the knowledge-anchored categories against **K-Means** clusters to ensure semantic consistency before scoring confidence. A sentence-transformer model (all-MiniLM-L6-v2) powers additional HF clustering confidence on semantic embeddings.
-    
-    ### 4. Anomaly Detection
-    We use the **Isolation Forest** algorithm on both TF-IDF features and Hugging Face embeddings to flag unusual items with *HF_Anomaly_Flag*.
-    
-    ### 5. Fuzzy Match & Conflict Resolution
-    We use the **Levenshtein Distance** algorithm. However, we've added a **Business Logic Layer**: if two items have similar text but conflicting 'Technical DNA' (e.g. one is Male, one is Female), the system overrides the AI and flags it as a **Variant**, not a duplicate. We also run a semantic duplicate check using cosine similarity on sentence-transformer embeddings within a small window.
-    """)
+    st.markdown("### Stack Info")
+    st.json({
+        "Timeout": f"{HF_INFERENCE_TIMEOUT}s",
+        "ZeroShot Model": HF_ZERO_SHOT_MODEL,
+        "Embedding Model": HF_EMBEDDING_MODEL,
+        "Backend": "Hugging Face Inference API" if ai_health["enabled"] else "Local Scikit-Learn"
+    })
 
-# --- PAGE: MY APPROACH ---
+# --- PAGE 5: MY APPROACH ---
 with page[4]:
     st.markdown("#### 🧭 My Approach")
-    st.markdown("A concise walkthrough of the full end-to-end workflow implemented across the app.")
     st.markdown("""
-    <h2>🏛️ Architectural Philosophy: The Hybrid Intelligence Model</h2>
-    <p>The core strength of this application lies in its <b>Hybrid AI Approach</b>. Rather than relying on a single algorithm, it combines three distinct layers of logic to ensure accuracy:</p>
-    <ol>
-        <li><p><b>Heuristic Layer:</b> Uses a predefined Knowledge Base and Regular Expressions (RegEx) for absolute technical accuracy.</p></li>
-        <li><p><b>Statistical Layer (Classical ML):</b> Employs <b>TF-IDF</b>, <b>K-Means</b>, and <b>Isolation Forest</b> for pattern recognition and anomaly detection based on the specific dataset.</p></li>
-        <li><p><b>Neural Layer (Deep Learning):</b> Leverages <b>Hugging Face Inference APIs</b> (BART and Sentence-Transformers) for semantic understanding and zero-shot classification.</p></li>
-    </ol>
-    <hr>
-    <h2>🛠️ Phase 1: Data Standardization &amp; "Tech DNA" Extraction</h2>
-    <p>The system first cleanses the data to remove "noise" (special characters, case inconsistencies) that typically disrupts auditing.</p>
-    <ul>
-        <li><p><b>Standardization:</b> The <code>clean_description</code> function normalizes descriptions (e.g., converting "O-RING" to "O RING" and "MECH-SEAL" to "MECHANICAL SEAL").</p></li>
-        <li><p><b>Feature Engineering (Tech DNA):</b> The <code>get_tech_dna</code> function is a specialized parser. It extracts "Genetic Markers" of an inventory item—specifically <b>numeric values</b> and <b>technical attributes</b> (Gender, Connection type, Pressure rating). This allows the AI to distinguish between a "Male Valve" and a "Female Valve" even if the text descriptions are 99% similar.</p></li>
-    </ul>
-    <hr>
-    <h2>🏷️ Phase 2: Multi-Stage Categorization</h2>
-    <p>To ensure items are placed in the correct <code>Product_Group</code>, the app runs a parallel classification process:</p>
-    <h3>1. Rule-Based Noun Extraction</h3>
-    <p>The <code>intelligent_noun_extractor</code> uses a prioritized list of phrases (e.g., "BALL VALVE" takes precedence over "VALVE") to identify the "Part Noun."</p>
-    <h3>2. Zero-Shot Classification (Deep Learning)</h3>
-    <p>If enabled, the system calls the <code>facebook/bart-large-mnli</code> model. Unlike traditional models, this does not require training on your specific data; it uses its pre-trained "knowledge" of the English language to categorize items into labels like "Fasteners &amp; Seals" or "Piping &amp; Fittings."</p>
-    <h3>3. Cluster Validation</h3>
-    <p>The system uses <b>K-Means Clustering</b> to group items that are mathematically similar. It then checks if the "Human Logic" category matches the "Machine Logic" cluster. If they match, the <b>Confidence Score</b> increases.</p>
-    <hr>
-    <h2>🚨 Phase 3: The Quality &amp; Audit Hub</h2>
-    <p>This is the engine's "Defense Layer," designed to catch errors that a human auditor might miss.</p>
-    <h3>Anomaly Detection (Isolation Forest)</h3>
-    <p>The <code>IsolationForest</code> algorithm treats the inventory list as a multi-dimensional map. Items that exist in "lonely" areas of this map (mathematical outliers) are flagged as anomalies. This is excellent for catching typos or items that simply don't belong in the catalog.</p>
-    <h3>Fuzzy vs. Semantic Duplicates</h3>
-    <ul>
-        <li><p><b>Fuzzy Matching:</b> Uses Levenshtein distance to find text-based similarities.</p></li>
-        <li><p><b>Semantic Matching:</b> Uses <b>Cosine Similarity</b> on high-dimensional vectors (Embeddings).</p></li>
-        <li><p><b>The "Spec-Trap" Override:</b> Crucially, if two items have a high similarity score but different "Tech DNA" (e.g., one is 150# rating and the other is 300#), the system overrides the duplicate flag and labels it a <b>Variant</b>.</p></li>
-    </ul>
-    <hr>
-    <h2>📈 Phase 4: Executive Insights (Streamlit UI)</h2>
-    <p>The final layer translates complex data into actionable metrics using <b>Plotly</b>:</p>
-    <ul>
-        <li><p><b>Inventory Health Gauge:</b> A real-time calculation of data accuracy.</p></li>
-        <li><p><b>Confidence Distribution:</b> A histogram showing the reliability of the AI's categorization.</p></li>
-        <li><p><b>Duplicate Pairs:</b> A structured list of potential risks for procurement and warehouse teams.</p></li>
-    </ul>
-    <hr>
-    <h2>🧰 Technical Stack Summary</h2>
-
-    | Component | Technology |
-    | - | - |
-    | Frontend | Streamlit |
-    | Data Processing | Pandas, NumPy, RegEx |
-    | Machine Learning | Scikit-Learn (KMeans, Isolation Forest) |
-    | Deep Learning | Hugging Face Inference API (BART, MiniLM) |
-    | Visualizations | Plotly Express &amp; Graph Objects |
-    """, unsafe_allow_html=True)
+    This app uses a **Hybrid Intelligence Model**:
+    1. **Heuristic Layer:** Regex & Knowledge Base for exact parsing of technical specs.
+    2. **Statistical Layer:** TF-IDF & K-Means for local pattern recognition.
+    3. **Neural Layer:** Hugging Face Transformers for semantic understanding.
+    """)
