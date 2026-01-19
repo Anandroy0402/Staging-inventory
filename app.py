@@ -14,28 +14,29 @@ from sklearn.ensemble import IsolationForest
 from sklearn.cluster import KMeans
 import plotly.express as px
 import plotly.graph_objects as go
+# --- FIX 1: TOML SUPPORT (Resolves 'NameError: name tomllib is not defined') ---
+try:
+    import tomllib
+except ImportError:
+    # Fallback for Python < 3.11
+    import tomli as tomllib
 
-# Hugging Face Hub Integration
+# --- FIX 2: HUGGING FACE (Resolves missing dependencies & path errors) ---
 import huggingface_hub
-
-# Correct Import Paths for Newer Versions (v0.17+)
 try:
     from huggingface_hub import InferenceClient
-    from huggingface_hub.errors import (
-        InferenceTimeoutError, 
-        HfHubHTTPError
-    )
+    # Correct error imports for newer huggingface_hub versions
+    from huggingface_hub.errors import InferenceTimeoutError, HfHubHTTPError
     
-    # Define a dummy alias for RateLimitError since it doesn't exist 
-    # (We handle it via HfHubHTTPError 429 later)
-    RateLimitError = HfHubHTTPError 
+    # Create alias for RateLimitError since it was removed in v0.20+
+    # We will handle 429 status codes manually using HfHubHTTPError
+    RateLimitError = HfHubHTTPError
     
-except ImportError as e:
-    st.error(f"Import Error: {e}")
-    st.info("💡 Solution: Your 'huggingface_hub' version might be outdated or the import paths are incorrect.")
+except ImportError:
+    st.error("Missing dependency: pip install huggingface_hub>=0.20.0")
     st.stop()
 except Exception as e:
-    st.error(f"Unexpected Error: {e}")
+    st.error(f"Error importing Hugging Face libraries: {e}")
     st.stop()
 
 # --- PAGE CONFIG ---
