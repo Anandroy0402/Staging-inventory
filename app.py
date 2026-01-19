@@ -23,6 +23,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # Hugging Face Hub Integration
+import huggingface_hub
 try:
     from huggingface_hub import InferenceClient
     from huggingface_hub.utils import InferenceTimeoutError, RateLimitError, HfHubHTTPError
