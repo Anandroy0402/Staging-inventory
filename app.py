@@ -13,7 +13,6 @@ except ImportError:
 import time
 from pathlib import Path
 from difflib import SequenceMatcher
-from urllib import request, error
 
 # Advanced AI/ML Imports
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -22,6 +21,14 @@ from sklearn.ensemble import IsolationForest
 from sklearn.cluster import KMeans
 import plotly.express as px
 import plotly.graph_objects as go
+
+# Hugging Face Hub Integration
+try:
+    from huggingface_hub import InferenceClient
+    from huggingface_hub.utils import InferenceTimeoutError, RateLimitError, HfHubHTTPError
+except ImportError:
+    st.error("Missing dependency: pip install huggingface_hub")
+    st.stop()
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="AI Inventory Auditor Pro", layout="wide", page_icon="🛡️")
@@ -50,23 +57,6 @@ def get_streamlit_secrets():
 def resolve_bool_setting(key, default=False):
     """
     Resolve a boolean setting from environment variables or secrets.
-    
-    Checks in order:
-    1. Environment variable
-    2. File-based secrets (.streamlit/secrets.toml)
-    3. Streamlit secrets (st.secrets)
-    4. Default value
-    
-    Args:
-        key: The setting key to look up
-        default: Default value if key is not found (default: False)
-    
-    Returns:
-        bool: The resolved boolean value
-    
-    Note:
-        String values are converted to boolean by checking if they equal "true"
-        (case-insensitive after stripping whitespace).
     """
     value = os.getenv(key)
     if value is None:
@@ -289,110 +279,48 @@ def check_hf_api_connectivity():
                 # Ignore errors during cleanup
                 pass
 
-def call_hf_inference(model, payload, token, warning_message, show_warnings=True, retry_count=0):
+def execute_hf_with_backoff(func, warning_message, retries=0):
     """
-    Call Hugging Face Inference API with improved error handling and retry logic.
-    Returns None on failure, result on success.
+    Helper wrapper to execute InferenceClient functions with exponential backoff 
+    matching the original logic.
     """
-    if not token:
-        return None
-    
-    data = json.dumps(payload).encode("utf-8")
-    req = request.Request(
-        f"{HF_INFERENCE_API_URL}/{model}",
-        data=data,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    )
-    
     try:
-        with request.urlopen(req, timeout=HF_INFERENCE_TIMEOUT) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        
-        # Check if API returned an error in the response
-        if isinstance(result, dict) and result.get("error"):
-            error_msg = result.get('error', 'Unknown error')
-            
-            # Check if model is loading and we should retry
-            is_model_loading = any(pattern in error_msg.lower() for pattern in HF_MODEL_LOADING_PATTERNS)
-            
-            if is_model_loading and retry_count < HF_MAX_RETRIES:
-                # Exponential backoff with maximum delay cap
-                delay = min(HF_RETRY_DELAY * (2 ** retry_count), HF_MAX_RETRY_DELAY)
-                time.sleep(delay)
-                return call_hf_inference(model, payload, token, warning_message, show_warnings, retry_count + 1)
-            
-            if show_warnings:
-                st.warning(f"{warning_message}: API returned error - {error_msg}")
-            return None
-        
-        return result
-        
-    except error.HTTPError as exc:
-        # HTTP errors (4xx, 5xx)
-        detail = f"HTTP {exc.code}"
+        return func()
+    except (InferenceTimeoutError, RateLimitError, HfHubHTTPError) as e:
+        # Determine if retryable based on original logic or library exceptions
         is_retryable = False
         
-        if exc.code == 401:
-            detail += " - Invalid or expired token"
-        elif exc.code == 403:
-            detail += " - Access forbidden"
-        elif exc.code == 429:
-            detail += " - Rate limit exceeded"
+        # Library exceptions that imply retry
+        if isinstance(e, (InferenceTimeoutError, RateLimitError)):
             is_retryable = True
-        elif exc.code == 503:
-            detail += " - Service temporarily unavailable"
-            is_retryable = True
-        elif exc.code >= 500:
-            detail += " - Server error"
-            is_retryable = True
+        elif isinstance(e, HfHubHTTPError):
+            # 503 is Service Unavailable (often loading), 429 is Rate Limit
+            if e.response.status_code in [429, 503, 504]:
+                is_retryable = True
+            # Check text patterns for "loading"
+            if any(p in str(e).lower() for p in HF_MODEL_LOADING_PATTERNS):
+                is_retryable = True
         
-        # Retry on transient errors with exponential backoff and cap
-        if is_retryable and retry_count < HF_MAX_RETRIES:
-            delay = min(HF_RETRY_DELAY * (2 ** retry_count), HF_MAX_RETRY_DELAY)
+        # Fallback generic exception check for loading strings
+        if any(p in str(e).lower() for p in HF_MODEL_LOADING_PATTERNS):
+            is_retryable = True
+
+        if is_retryable and retries < HF_MAX_RETRIES:
+            # Exponential backoff with maximum delay cap
+            delay = min(HF_RETRY_DELAY * (2 ** retries), HF_MAX_RETRY_DELAY)
             time.sleep(delay)
-            return call_hf_inference(model, payload, token, warning_message, show_warnings, retry_count + 1)
+            return execute_hf_with_backoff(func, warning_message, retries + 1)
         
-        if show_warnings:
-            st.warning(f"{warning_message}: {detail}")
+        st.warning(f"{warning_message}: API returned error - {str(e)}")
         return None
-        
-    except error.URLError as exc:
-        # Network/DNS errors - typically not retryable
-        error_reason = str(exc.reason)
-        
-        if isinstance(exc.reason, socket.gaierror):
-            # DNS resolution failure
-            detail = "DNS resolution failed - Hugging Face API may be blocked by firewall or network"
-        elif isinstance(exc.reason, socket.timeout):
-            detail = "Connection timeout - Network may be slow or API unreachable"
-        elif "Connection refused" in error_reason:
-            detail = "Connection refused - Service may be down"
-        elif "Network is unreachable" in error_reason:
-            detail = "Network unreachable - Check network connectivity"
-        else:
-            detail = f"Network error - {error_reason}"
-        
-        if show_warnings:
-            st.warning(f"{warning_message}: {detail}")
-        return None
-        
-    except socket.timeout:
-        # Explicit timeout - could be transient
-        if retry_count < HF_MAX_RETRIES:
-            delay = min(HF_RETRY_DELAY * (2 ** retry_count), HF_MAX_RETRY_DELAY)
+    except Exception as e:
+        # Generic catch-all for other library issues
+        if any(p in str(e).lower() for p in HF_MODEL_LOADING_PATTERNS) and retries < HF_MAX_RETRIES:
+            delay = min(HF_RETRY_DELAY * (2 ** retries), HF_MAX_RETRY_DELAY)
             time.sleep(delay)
-            return call_hf_inference(model, payload, token, warning_message, show_warnings, retry_count + 1)
-        
-        detail = "Request timeout - API response took too long"
-        if show_warnings:
-            st.warning(f"{warning_message}: {detail}")
-        return None
-        
-    except ValueError as exc:
-        # JSON parsing error
-        detail = "Invalid response format - Could not parse API response"
-        if show_warnings:
-            st.warning(f"{warning_message}: {detail}")
+            return execute_hf_with_backoff(func, warning_message, retries + 1)
+            
+        st.warning(f"{warning_message}: {str(e)}")
         return None
 
 def run_hf_zero_shot(texts, labels):
@@ -402,31 +330,36 @@ def run_hf_zero_shot(texts, labels):
         return None
     if isinstance(texts, str):
         texts = [texts]
+    
     try:
+        client = InferenceClient(token=token, timeout=HF_INFERENCE_TIMEOUT)
         results = []
         for start in range(0, len(texts), HF_BATCH_SIZE):
             batch = texts[start:start + HF_BATCH_SIZE]
-            payload = {
-                "inputs": batch,
-                "parameters": {
-                    "candidate_labels": labels,
-                    "hypothesis_template": "This industrial inventory item is {}"
-                },
-                "options": {"wait_for_model": True}
-            }
-            batch_results = call_hf_inference(
-                HF_ZERO_SHOT_MODEL,
-                payload,
-                token,
+            
+            # Define the call for the batch
+            def _call():
+                return client.zero_shot_classification(
+                    batch, 
+                    labels, 
+                    hypothesis_template="This industrial inventory item is {}"
+                )
+            
+            batch_results = execute_hf_with_backoff(
+                _call,
                 "Hugging Face classification failed; using existing categories."
             )
+            
             if not batch_results:
                 return None
+            
+            # Ensure list consistency
             if isinstance(batch_results, dict):
                 batch_results = [batch_results]
             results.extend(batch_results)
+            
         return results
-    except (RuntimeError, ValueError):
+    except Exception:
         st.warning("Hugging Face classification failed; using existing categories.")
         return None
 
@@ -435,28 +368,37 @@ def compute_embeddings(texts):
     if not token:
         st.warning("Hugging Face token missing; skipping hosted embeddings.")
         return None
+    
     try:
+        client = InferenceClient(token=token, timeout=HF_INFERENCE_TIMEOUT)
         embeddings = []
         for start in range(0, len(texts), HF_BATCH_SIZE):
             batch = texts[start:start + HF_BATCH_SIZE]
-            payload = {"inputs": batch, "options": {"wait_for_model": True}}
-            batch_embeddings = call_hf_inference(
-                HF_EMBEDDING_MODEL,
-                payload,
-                token,
+            
+            def _call():
+                return client.feature_extraction(batch, model=HF_EMBEDDING_MODEL)
+                
+            batch_embeddings = execute_hf_with_backoff(
+                _call,
                 "Embedding generation failed; falling back to TF-IDF signals."
             )
-            if not batch_embeddings:
+            
+            if batch_embeddings is None:
                 return None
-            if isinstance(batch_embeddings, list) and len(batch_embeddings) > 0 and isinstance(batch_embeddings[0], (int, float)):
-                # Hugging Face returns a flat list for single inputs; wrap for consistent batching.
-                batch_embeddings = [batch_embeddings]
+                
+            # Handle variable return types from the library (list vs ndarray)
+            if isinstance(batch_embeddings, list) and len(batch_embeddings) > 0:
+                 if isinstance(batch_embeddings[0], (int, float)):
+                     # Single embedding returned as flat list
+                     batch_embeddings = [batch_embeddings]
+            
             embeddings.extend(batch_embeddings)
+            
         embeddings = np.array(embeddings, dtype=float)
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         norms[norms == 0] = 1
         return embeddings / norms
-    except (RuntimeError, ValueError):
+    except Exception:
         st.warning("Embedding generation failed; falling back to TF-IDF signals.")
         return None
 
@@ -475,12 +417,14 @@ def is_valid_zero_shot_response(result):
     return False
 
 def is_valid_embedding_response(result):
-    if not isinstance(result, list) or not result:
+    if not isinstance(result, (list, np.ndarray)) or len(result) == 0:
         return False
-    if all(isinstance(x, (int, float)) for x in result):
+    # Check first item
+    first = result[0]
+    if isinstance(first, (int, float)):
         return True
-    if isinstance(result[0], list) and result[0]:
-        return all(isinstance(x, (int, float)) for x in result[0])
+    if isinstance(first, (list, np.ndarray)) and len(first) > 0:
+        return all(isinstance(x, (int, float)) for x in first)
     return False
 
 @st.cache_data(ttl=HF_CONNECTION_CACHE_TTL)
@@ -542,36 +486,33 @@ def test_hf_inference_connection(enable_hf_models):
             "connectivity_error": conn_error
         }
     
-    # Test zero-shot classification model
-    test_text = HF_CONNECTION_TEST_TEXT
-    zero_shot_payload = {
-        "inputs": [test_text],
-        "parameters": {
-            "candidate_labels": list(PRODUCT_GROUPS.keys()),
-            "hypothesis_template": "This industrial inventory item is {}"
-        },
-        "options": {"wait_for_model": True}
-    }
-    
-    zero_shot_result = call_hf_inference(
-        HF_ZERO_SHOT_MODEL,
-        zero_shot_payload,
-        token,
-        "Hugging Face zero-shot classification test failed",
-        show_warnings=False
-    )
-    zero_shot_ok = is_valid_zero_shot_response(zero_shot_result)
-    
-    # Test embedding model
-    embedding_payload = {"inputs": [test_text], "options": {"wait_for_model": True}}
-    embedding_result = call_hf_inference(
-        HF_EMBEDDING_MODEL,
-        embedding_payload,
-        token,
-        "Hugging Face embedding test failed",
-        show_warnings=False
-    )
-    embedding_ok = is_valid_embedding_response(embedding_result)
+    # Test with Hub Library
+    try:
+        client = InferenceClient(token=token, timeout=HF_INFERENCE_TIMEOUT)
+        test_text = HF_CONNECTION_TEST_TEXT
+        
+        # Test Zero Shot
+        def _test_zs():
+            return client.zero_shot_classification(
+                test_text, 
+                list(PRODUCT_GROUPS.keys()), 
+                hypothesis_template="This industrial inventory item is {}"
+            )
+        zero_shot_result = execute_hf_with_backoff(_test_zs, "HF Zero Shot Test Failed")
+        zero_shot_ok = is_valid_zero_shot_response(zero_shot_result)
+        
+        # Test Embeddings
+        def _test_emb():
+            return client.feature_extraction(test_text, model=HF_EMBEDDING_MODEL)
+        embedding_result = execute_hf_with_backoff(_test_emb, "HF Embedding Test Failed")
+        embedding_ok = is_valid_embedding_response(embedding_result)
+        
+    except Exception as e:
+        zero_shot_ok = False
+        embedding_ok = False
+        error_detail = str(e)
+    else:
+        error_detail = None
     
     # Determine overall status
     if zero_shot_ok and embedding_ok:
@@ -587,7 +528,8 @@ def test_hf_inference_connection(enable_hf_models):
         error_detail = f"Some models unavailable: {', '.join(failed_models)}"
     else:
         status = "unavailable"
-        error_detail = "Both zero-shot classification and embedding models failed to respond"
+        if not error_detail:
+            error_detail = "Both zero-shot classification and embedding models failed to respond"
     
     enabled = status in {"full", "partial"}
     reason = None if enabled else "inference_test_failed"
