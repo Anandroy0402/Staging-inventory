@@ -16,16 +16,26 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # Hugging Face Hub Integration
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib
+import huggingface_hub
 
+# Correct Import Paths for Newer Versions (v0.17+)
 try:
     from huggingface_hub import InferenceClient
-    from huggingface_hub.utils import InferenceTimeoutError, RateLimitError, HfHubHTTPError
-except ImportError:
-    st.error("Missing dependency: pip install huggingface_hub")
+    from huggingface_hub.errors import (
+        InferenceTimeoutError, 
+        HfHubHTTPError
+    )
+    
+    # Define a dummy alias for RateLimitError since it doesn't exist 
+    # (We handle it via HfHubHTTPError 429 later)
+    RateLimitError = HfHubHTTPError 
+    
+except ImportError as e:
+    st.error(f"Import Error: {e}")
+    st.info("💡 Solution: Your 'huggingface_hub' version might be outdated or the import paths are incorrect.")
+    st.stop()
+except Exception as e:
+    st.error(f"Unexpected Error: {e}")
     st.stop()
 
 # --- PAGE CONFIG ---
